@@ -1,9 +1,6 @@
 # Clean Watermarking Project v2
 
 This project refactors the uploaded watermarking code into a clean Python package for a proposal-paper benchmark.
-The project is intended to serve as the experimental foundation for an upcoming research work. In particular, it supports the validation and benchmarking of the proposed watermarking method, with emphasis on achieving an effective balance between imperceptibility and robustness against diverse signal processing and geometric attacks.
-This project is developed by **[Pham Thi Yen]** as part of an ongoing research study on robust digital image watermarking.
-
 
 ## What changed in v2
 

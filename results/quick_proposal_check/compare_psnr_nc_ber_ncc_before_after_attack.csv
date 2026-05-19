@@ -1,0 +1,2 @@
+method_id,method_name,ber_mean_after_attack,ber_mean_before_attack,nc_mean_after_attack,nc_mean_before_attack,ncc_mean_after_attack,ncc_mean_before_attack,psnr_mean_after_attack,psnr_mean_before_attack
+proposal,Proposal_QH_DWT_Hess,0.202001953125,0.00537109375,0.823878226774772,0.9946773221932681,0.6087432387129909,0.9892741487041742,26.497898112072818,71.15344695239028
