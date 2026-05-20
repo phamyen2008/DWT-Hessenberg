@@ -1,0 +1,5 @@
+method_id,method_name,ber_mean_before_attack,nc_mean_before_attack,ncc_mean_before_attack,psnr_mean_before_attack
+dwt_hd_svd_2025,DWT_HD_SVD_2025,0.00341796875,0.9966062924064687,0.9931680203150749,39.766723330217445
+gaata2022_dwt_hess_fwa,Gaata2022_DWT_Hess_FWA,0.057373046875,0.9412056036983241,0.8909993993980808,53.93901407498156
+kumar2021,Kumar2021_LWT_Entropy,0.0,1.0,1.0,70.73257790724323
+mahto2022_firefly_dual,Mahto2022_Firefly_Dual,0.0,1.0,1.0,41.53428303210869

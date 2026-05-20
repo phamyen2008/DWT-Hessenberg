@@ -1,0 +1,2 @@
+method_id,method_name,ber_mean_after_attack,ber_mean_before_attack,nc_mean_after_attack,nc_mean_before_attack,ncc_mean_after_attack,ncc_mean_before_attack,psnr_mean_after_attack,psnr_mean_before_attack
+dwt_hd_svd_2025,DWT_HD_SVD_2025,0.1820556640625,0.00341796875,0.819243878486593,0.9966062924064687,0.6359041271007765,0.9931680203150749,25.94470961923677,39.766723330217445

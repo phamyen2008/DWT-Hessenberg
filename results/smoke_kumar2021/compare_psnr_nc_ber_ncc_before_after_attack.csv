@@ -1,0 +1,2 @@
+method_id,method_name,ber_mean_after_attack,ber_mean_before_attack,nc_mean_after_attack,nc_mean_before_attack,ncc_mean_after_attack,ncc_mean_before_attack,psnr_mean_after_attack,psnr_mean_before_attack
+kumar2021,Kumar2021_LWT_Entropy,0.124365234375,0.0,0.8759633175659209,1.0,0.751296973662247,1.0,26.49818394307414,70.73257790724323

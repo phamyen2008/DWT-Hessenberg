@@ -526,6 +526,8 @@ def stress_attack_suite(include_none: bool = True) -> list[AttackConfig]:
 
 def default_attack_suite(include_none: bool = True, preset: str = "lite") -> list[AttackConfig]:
     preset = str(preset).lower().strip()
+    if preset in {"none", "clean", "no_attack"}:
+        return [AttackConfig("no_attack", "none", {})] if include_none else []
     if preset in {"lite", "small", "quick"}:
         return lite_attack_suite(include_none=include_none)
     if preset in {"full", "all"}:

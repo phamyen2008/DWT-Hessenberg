@@ -1,0 +1,3 @@
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src pytest -q
+..............................................s......                    [100%]
+52 passed, 1 skipped in 19.35s

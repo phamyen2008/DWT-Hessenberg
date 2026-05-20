@@ -1,0 +1,2 @@
+method_id,method_name,ber_mean_after_attack,ber_mean_before_attack,nc_mean_after_attack,nc_mean_before_attack,ncc_mean_after_attack,ncc_mean_before_attack,psnr_mean_after_attack,psnr_mean_before_attack
+gaata2022_dwt_hess_fwa,Gaata2022_DWT_Hess_FWA,0.388427734375,0.057373046875,0.33972452766994554,0.9412056036983241,0.25526070866680184,0.8909993993980808,26.49015227610342,53.93901407498156

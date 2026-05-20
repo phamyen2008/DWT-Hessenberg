@@ -1,0 +1,2 @@
+method_id,method_name,ber_mean_after_attack,ber_mean_before_attack,nc_mean_after_attack,nc_mean_before_attack,ncc_mean_after_attack,ncc_mean_before_attack,psnr_mean_after_attack,psnr_mean_before_attack
+mahto2022_firefly_dual,Mahto2022_Firefly_Dual,0.194677734375,0.0,0.8076594713320983,1.0,0.610633291143403,1.0,26.244427798500464,41.53428303210869

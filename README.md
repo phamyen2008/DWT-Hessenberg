@@ -1,21 +1,27 @@
-# Clean Watermarking Project v2
+# Clean Watermarking Project v5
 
-This project refactors the uploaded watermarking code into a clean Python package for a proposal-paper benchmark.
+This project is a reproducible Python benchmark for color-image watermarking experiments.  It now contains the proposal method plus the four paper-guided baselines supplied with the uploaded reports.
 
-## What changed in v2
+## Common benchmark contract
 
-- Restored the proposal method closer to `optimal_dwt_hess.ipynb`:
-  - pywt-compatible orthonormal Haar DWT math,
-  - Q4 branch: `q22^2 + q32^2 >= tau`,
-  - H-domain branch: QIM on `h21` / `h22`,
-  - Bit Survival Score candidate screening,
-  - structured repetition and majority voting,
-  - optional optimizer **OFF by default**.
-- Added a larger deterministic attack suite in `src/watermarklab/common/attack.py`.
-- Added math-focused tests for DWT, IWT, Arnold, chaotic encryption/decryption, SVD, Hessenberg, metrics, and proposal Q/H embedding logic.
-- All methods accept the common input format:
-  - host image: `512 x 512` RGB / 24-bit color,
-  - watermark: `64 x 64` binary.
+All benchmark methods accept the same input format:
+
+```text
+Host image: 512 x 512 RGB / 24-bit color
+Watermark:  64 x 64 binary image
+Metrics:    PSNR, SSIM, NC, NCC, BER
+```
+
+## Included methods
+
+| Method id | Paper-guided method | Notes |
+|---|---|---|
+| `kumar2021` | Kumar & Singh 2021 DWT/LWT maximum-entropy baseline | YCbCr-Y channel, DWT/IWT, max-entropy 32x32 block, alpha blending |
+| `gaata2022_dwt_hess_fwa` | Gaata et al. 2022 DWT + Hessenberg + Firework Algorithm baseline | RGB split, DWT detail-band embedding matrix, chaotic keys, Hessenberg parity embedding; default common mode is quantization-aware |
+| `mahto2022_firefly_dual` | Mahto & Singh 2022 firefly-optimized dual/multi watermark baseline | R-channel text mark, G-channel payload mark, B-channel encrypted image mark |
+| `dwt_hd_svd_2025` | DWT-HD-SVD chaotic mapping baseline | YCbCr-Y, DWT LL, Hessenberg/HD, SVD, logistic chaotic watermark encryption |
+| `proposal` | Proposed Q/H DWT-Hessenberg method | Optional optimizer is OFF by default |
+| `roy2018`, `iwt_hess_svd_2024` | Older internal comparison baselines | Kept for backward compatibility |
 
 ## Install
 
@@ -26,72 +32,81 @@ pip install -r requirements.txt
 ## Run tests
 
 ```bash
-PYTHONPATH=src pytest -q
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src pytest -q
 ```
 
-Expected result in the checked package:
+Expected result in this checked package:
 
 ```text
-23 passed
+52 passed, 1 skipped
 ```
 
-## Run all methods
-
-Practical run, using the lite attack suite and proposal repetition factor 3:
+The skipped test is the intentionally slow proposal end-to-end validation.  To run it:
 
 ```bash
-PYTHONPATH=src python main.py \
-  --host-dir data/host \
-  --watermark data/watermark/wm.png \
-  --output results/common_benchmark \
-  --attack-preset lite \
-  --proposal-repeat 3
+RUN_SLOW_PROPOSAL=1 OPENBLAS_NUM_THREADS=1 PYTHONPATH=src pytest -q \
+  tests/test_proposal_validation_layer.py::test_proposal_end_to_end_validation_layer_on_real_input
 ```
 
-For a quick smoke run on one image:
+## Run the four uploaded baselines only
+
+Clean/no-attack smoke test:
 
 ```bash
-PYTHONPATH=src python main.py \
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src python main.py \
+  --methods kumar2021,gaata2022_dwt_hess_fwa,mahto2022_firefly_dual,dwt_hd_svd_2025 \
+  --max-images 1 \
+  --no-save-images \
+  --attack-preset none \
+  --output results/four_baseline_clean_smoke
+```
+
+Lite attack run for a single baseline:
+
+```bash
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src python main.py \
+  --methods kumar2021 \
   --max-images 1 \
   --no-save-images \
   --attack-preset lite \
-  --proposal-repeat 3 \
-  --output results/quick_all_methods
+  --output results/kumar2021_lite_smoke
 ```
 
-## Proposal method options
+Available attack presets:
 
-Optimizer is disabled by default for fair comparison. To enable adaptive/oracle proposal optimization:
-
-```bash
-PYTHONPATH=src python main.py \
-  --methods proposal \
-  --proposal-use-optimizer \
-  --proposal-optimizer-trials 4 \
-  --proposal-repeat 3 \
-  --max-images 1 \
-  --output results/proposal_optimizer_demo
+```text
+none    clean extraction only
+lite    JPEG/noise/filter/geometric/photometric quick suite
+stress  compact but harsher suite
+full    large attack suite
 ```
 
-To run the notebook-style full structured repetition, use:
+## Paper-similarity tests for the four baselines
 
-```bash
---proposal-repeat auto
+The new test file is:
+
+```text
+tests/test_uploaded_baseline_paper_report_similarity.py
 ```
 
-`auto` uses all available DWT blocks and is much slower. Use it for final proposal-only experiments, not for every quick test.
+It checks that the four supplied baselines are registered and that clean/no-attack results match the scale reported in the supplied papers:
 
-## Full attack suite
+- Kumar 2021: PSNR around or above the paper-reported 51.6145 dB, SSIM near 0.999, NCC near 1.
+- Gaata 2022: high PSNR and high clean retrieval using the DWT/Hessenberg/key path.
+- Mahto 2022: three-channel payload structure and clean watermark recovery.
+- DWT-HD-SVD 2025: PSNR close to the reported 45.3437 dB scale and NCC above 0.95.
 
-The full attack suite includes compression, noise, filtering, geometric, occlusion, photometric, and quantization attacks:
+## Important reproducibility notes
 
-```bash
-PYTHONPATH=src python main.py \
-  --methods proposal \
-  --max-images 1 \
-  --attack-preset full \
-  --proposal-repeat 3 \
-  --output results/proposal_full_attack_demo
+These implementations are **paper-guided reproductions**, not byte-identical reproductions of private author code.  Several papers omit implementation-level choices such as exact wavelet library, contourlet implementation, optimizer iteration count, chaotic-map safeguards, image resizing policy, and side information.  The code documents those assumptions in wrapper classes, tests, and `docs/BASELINE_VALIDATION_V5.md`.
+
+For final manuscript tables, keep these categories separate:
+
+```text
+1. Original-paper reported results
+2. Paper-guided reproduction results
+3. Unified common-benchmark results
+4. Proposal-only validation results
 ```
 
 ## Main output files
@@ -105,64 +120,18 @@ compare_psnr_nc_ber_ncc_before_after_attack.csv
 failures.json
 ```
 
-## Important research note
+## Proposal options
 
-Use `proposal-repeat 3` for practical fair comparison. Use `proposal-repeat auto` only when you want the closest notebook-style structured repetition, because it can be much slower. If optimizer is enabled, report it separately as an adaptive/oracle variant, not mixed with fixed-parameter baselines.
-
-## V3 paper-compliance tests
-
-This release adds stricter paper-compliance and math-correctness tests. See:
-
-- `docs/PAPER_COMPLIANCE_TEST_PLAN.md`
-- `CHANGELOG_REFACTOR_V3.md`
-
-Run:
+Optimizer is disabled by default for fair comparison. To enable adaptive/oracle proposal optimization:
 
 ```bash
-PYTHONPATH=src pytest -q
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src python main.py \
+  --methods proposal \
+  --proposal-use-optimizer \
+  --proposal-optimizer-trials 4 \
+  --proposal-repeat 3 \
+  --max-images 1 \
+  --output results/proposal_optimizer_demo
 ```
 
-Expected in this release:
-
-```text
-40 passed
-```
-
-## V4: Proposal validation layer
-
-To check that the proposal implementation still follows the notebook-level math contract:
-
-```bash
-PYTHONPATH=src python tools/validate_proposal.py --no-end-to-end
-```
-
-To include a real no-attack embed/extract check:
-
-```bash
-PYTHONPATH=src python tools/validate_proposal.py \
-  --host data/host/lenna.bmp \
-  --watermark data/watermark/wm.png
-```
-
-The validation report is written to:
-
-```text
-results/proposal_validation_report.json
-```
-
-The attack module now has three presets:
-
-```bash
---attack-preset lite
---attack-preset full
---attack-preset stress
-```
-
-`stress` is a compact but harder suite for proposal robustness checks.
-
-To run the slow real proposal end-to-end pytest check:
-
-```bash
-RUN_SLOW_PROPOSAL=1 PYTHONPATH=src pytest -q \
-  tests/test_proposal_validation_layer.py::test_proposal_end_to_end_validation_layer_on_real_input
-```
+Use `--proposal-repeat auto` only for proposal-only final experiments because it is much slower.
