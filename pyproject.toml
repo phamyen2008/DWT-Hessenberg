@@ -1,9 +1,9 @@
 [project]
-name = "clean-watermarking-project"
-version = "0.1.0"
-description = "Clean benchmark framework for color image watermarking proposal paper"
+name = "watermarklab-baselines-cleaned"
+version = "0.2.0"
+description = "Clean modular benchmark for four watermarking baselines plus proposal method"
 requires-python = ">=3.10"
-dependencies = ["numpy", "pillow", "scipy", "scikit-image", "pandas"]
+dependencies = ["numpy", "pillow", "scipy", "scikit-image", "pandas", "opencv-python", "PyWavelets"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

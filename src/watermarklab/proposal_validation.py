@@ -34,6 +34,11 @@ def proposal_notebook_contract() -> dict[str, Any]:
     return {
         "host_shape": (512, 512, 3),
         "watermark_shape": (64, 64),
+        "watermark_payload_shape": (32, 32),
+        "watermark_payload_len": 1024,
+        "watermark_dwt_enabled": True,
+        "watermark_payload_band": "LL",
+        "host_embed_color_space": "YCrCb",
         "block_size": 4,
         "private_key": "KB123",
         "arnold_iterations": 17,
@@ -41,7 +46,7 @@ def proposal_notebook_contract() -> dict[str, Any]:
         "dwt_level": 1,
         "dwt_mode": "orthonormal",
         "dwt_bands": ("LL", "HL", "HH", "LH"),
-        "host_channels": (0, 1, 2),
+        "host_channels": (0,),
         "flag_q4": 0,
         "flag_hpos": 1,
         "flag_skip": 2,
@@ -66,6 +71,9 @@ def validate_proposal_params(params: ProposalParams | None = None) -> dict[str, 
         "arnold_iterations": int(p.arnold_iterations) == c["arnold_iterations"],
         "dwt_mode": str(p.dwt_mode) == c["dwt_mode"],
         "dwt_bands": tuple(p.dwt_bands) == tuple(c["dwt_bands"]),
+        "host_channels": tuple(p.host_channels) == tuple(c["host_channels"]),
+        "watermark_dwt_enabled": bool(p.watermark_dwt_enabled) == c["watermark_dwt_enabled"],
+        "watermark_payload_band": str(p.watermark_payload_band) == c["watermark_payload_band"],
         "q4_tau": np.isclose(float(p.q4_tau), c["q4_tau"]),
         "q4_margin": np.isclose(float(p.q4_margin), c["q4_margin"]),
         "h01_q": np.isclose(float(p.h01_q), c["h01_q"]),
@@ -120,15 +128,16 @@ def validate_proposal_math_branches(params: ProposalParams | None = None) -> dic
     return {"ok": all(checks.values()), "checks": checks, "q4": q_results, "hpos": h_results, "qim": qim_results}
 
 
-def validate_structured_schedule(total_blocks: int = 49152, payload_len: int = 4096, repeat: int | None = None) -> dict[str, Any]:
+def validate_structured_schedule(total_blocks: int = 16384, payload_len: int = 1024, repeat: int | None = None) -> dict[str, Any]:
     """Validate deterministic structured repetition schedule math.
 
-    The common benchmark uses 512x512 RGB images, one 1-level Haar split per
-    channel and four subbands. With 4x4 blocks this gives 49,152 candidate
-    blocks and maximum repeat factor 12 for a 64x64 watermark.
+    The source-script-faithful proposal uses 512x512 host images, one 1-level Haar split
+    on the Y channel and four subbands. With 4x4 blocks this gives 16,384
+    candidate blocks. The watermark-side DWT embeds only the 32x32 LL payload,
+    so the maximum repeat factor is 16.
     """
 
-    blocks = [(i % 3, "LL", i, 0) for i in range(int(total_blocks))]
+    blocks = [(0, "LL", i, 0) for i in range(int(total_blocks))]
     schedule, repeat_factor, usable_blocks = _make_structured_schedule(blocks, payload_len, repeat)
     counts = np.zeros(payload_len, dtype=np.int32)
     for bit_idx, *_ in schedule:

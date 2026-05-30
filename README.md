@@ -1,27 +1,40 @@
-# Clean Watermarking Project v5
+# WatermarkLab cleaned baseline project
 
-This project is a reproducible Python benchmark for color-image watermarking experiments.  It now contains the proposal method plus the four paper-guided baselines supplied with the uploaded reports.
+This is the cleaned version of your watermarking project. It keeps only:
 
-## Common benchmark contract
+1. **Paper 1 — Kumar 2021**: DWT + maximum entropy + alpha blending.
+2. **Paper 2 — Guo 2017**: DWT + QR + Firefly-Algorithm baseline family.
+3. **Paper 3 — Gaata 2022**: DWT + Hessenberg + Firework Algorithm.
+4. **Paper 4 — DWT-HD-SVD 2024/2025**: DWT + HD/Hessenberg + SVD + logistic chaos.
+5. **Your proposal method**.
 
-All benchmark methods accept the same input format:
+Older unrelated baselines have been removed.
+
+---
+
+## Project layout
 
 ```text
-Host image: 512 x 512 RGB / 24-bit color
-Watermark:  64 x 64 binary image
-Metrics:    PSNR, SSIM, NC, NCC, BER
+watermarklab_baselines_cleaned/
+├── data/
+│   ├── host/                    # 512x512 RGB host images
+│   └── watermark/               # 64x64 binary watermark
+├── docs/
+│   ├── BASELINE_METHODS.md
+│   └── baseline_paper_reported_results.csv
+├── src/watermarklab/
+│   ├── benchmark.py             # unified runner
+│   ├── common/                  # DWT, metrics, attacks, color, entropy, helpers
+│   ├── methods/                 # only four baselines + proposal
+│   └── vendor/dwt_hess_fwa/     # Gaata 2022 support code only
+├── tests/                       # lightweight smoke tests
+├── main.py
+├── run_all.py
+├── requirements.txt
+└── pyproject.toml
 ```
 
-## Included methods
-
-| Method id | Paper-guided method | Notes |
-|---|---|---|
-| `kumar2021` | Kumar & Singh 2021 DWT/LWT maximum-entropy baseline | YCbCr-Y channel, DWT/IWT, max-entropy 32x32 block, alpha blending |
-| `gaata2022_dwt_hess_fwa` | Gaata et al. 2022 DWT + Hessenberg + Firework Algorithm baseline | RGB split, DWT detail-band embedding matrix, chaotic keys, Hessenberg parity embedding; default common mode is quantization-aware |
-| `mahto2022_firefly_dual` | Mahto & Singh 2022 firefly-optimized dual/multi watermark baseline | R-channel text mark, G-channel payload mark, B-channel encrypted image mark |
-| `dwt_hd_svd_2025` | DWT-HD-SVD chaotic mapping baseline | YCbCr-Y, DWT LL, Hessenberg/HD, SVD, logistic chaotic watermark encryption |
-| `proposal` | Proposed Q/H DWT-Hessenberg method | Optional optimizer is OFF by default |
-| `roy2018`, `iwt_hess_svd_2024` | Older internal comparison baselines | Kept for backward compatibility |
+---
 
 ## Install
 
@@ -29,89 +42,102 @@ Metrics:    PSNR, SSIM, NC, NCC, BER
 pip install -r requirements.txt
 ```
 
+For reproducibility, run with:
+
+```bash
+export OPENBLAS_NUM_THREADS=1
+export PYTHONPATH=src
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:OPENBLAS_NUM_THREADS="1"
+$env:PYTHONPATH="src"
+```
+
+---
+
 ## Run tests
 
 ```bash
 OPENBLAS_NUM_THREADS=1 PYTHONPATH=src pytest -q
 ```
 
-Expected result in this checked package:
+---
 
-```text
-52 passed, 1 skipped
-```
+## Run only the four baselines
 
-The skipped test is the intentionally slow proposal end-to-end validation.  To run it:
-
-```bash
-RUN_SLOW_PROPOSAL=1 OPENBLAS_NUM_THREADS=1 PYTHONPATH=src pytest -q \
-  tests/test_proposal_validation_layer.py::test_proposal_end_to_end_validation_layer_on_real_input
-```
-
-## Run the four uploaded baselines only
-
-Clean/no-attack smoke test:
+Clean/no-attack quick check:
 
 ```bash
 OPENBLAS_NUM_THREADS=1 PYTHONPATH=src python main.py \
-  --methods kumar2021,gaata2022_dwt_hess_fwa,mahto2022_firefly_dual,dwt_hd_svd_2025 \
+  --methods baselines \
   --max-images 1 \
   --no-save-images \
   --attack-preset none \
-  --output results/four_baseline_clean_smoke
+  --output results/baseline_clean_smoke
 ```
 
-Lite attack run for a single baseline:
+Lite attack benchmark:
 
 ```bash
 OPENBLAS_NUM_THREADS=1 PYTHONPATH=src python main.py \
-  --methods kumar2021 \
-  --max-images 1 \
-  --no-save-images \
+  --methods baselines \
   --attack-preset lite \
-  --output results/kumar2021_lite_smoke
+  --output results/baseline_lite
 ```
 
-Available attack presets:
+Full attack benchmark:
+
+```bash
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src python main.py \
+  --methods baselines \
+  --attack-preset full \
+  --output results/baseline_full
+```
+
+---
+
+## Run baselines + proposal
+
+```bash
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src python main.py \
+  --methods all \
+  --attack-preset lite \
+  --proposal-repeat 3 \
+  --output results/common_benchmark
+```
+
+---
+
+## Run one method only
+
+```bash
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src python main.py \
+  --methods guo2017_dwt_qr_fa \
+  --max-images 1 \
+  --attack-preset lite \
+  --output results/guo2017_lite_smoke
+```
+
+Valid method IDs:
 
 ```text
-none    clean extraction only
-lite    JPEG/noise/filter/geometric/photometric quick suite
-stress  compact but harsher suite
-full    large attack suite
+kumar2021
+guo2017_dwt_qr_fa
+gaata2022_dwt_hess_fwa
+dwt_hd_svd_2025
+proposal
+baselines
+all
 ```
 
-## Paper-similarity tests for the four baselines
+---
 
-The new test file is:
+## Output files
 
-```text
-tests/test_uploaded_baseline_paper_report_similarity.py
-```
-
-It checks that the four supplied baselines are registered and that clean/no-attack results match the scale reported in the supplied papers:
-
-- Kumar 2021: PSNR around or above the paper-reported 51.6145 dB, SSIM near 0.999, NCC near 1.
-- Gaata 2022: high PSNR and high clean retrieval using the DWT/Hessenberg/key path.
-- Mahto 2022: three-channel payload structure and clean watermark recovery.
-- DWT-HD-SVD 2025: PSNR close to the reported 45.3437 dB scale and NCC above 0.95.
-
-## Important reproducibility notes
-
-These implementations are **paper-guided reproductions**, not byte-identical reproductions of private author code.  Several papers omit implementation-level choices such as exact wavelet library, contourlet implementation, optimizer iteration count, chaotic-map safeguards, image resizing policy, and side information.  The code documents those assumptions in wrapper classes, tests, and `docs/BASELINE_VALIDATION_V5.md`.
-
-For final manuscript tables, keep these categories separate:
-
-```text
-1. Original-paper reported results
-2. Paper-guided reproduction results
-3. Unified common-benchmark results
-4. Proposal-only validation results
-```
-
-## Main output files
-
-After running `main.py`, the benchmark exports:
+Each run writes:
 
 ```text
 per_image_attack_results.csv
@@ -120,18 +146,116 @@ compare_psnr_nc_ber_ncc_before_after_attack.csv
 failures.json
 ```
 
-## Proposal options
+The most useful file for manuscript tables is usually:
 
-Optimizer is disabled by default for fair comparison. To enable adaptive/oracle proposal optimization:
+```text
+compare_psnr_nc_ber_ncc_before_after_attack.csv
+```
+
+---
+
+## Important note about paper numbers
+
+The local baseline outputs may not exactly match the original paper tables. This project is now organized to avoid confusing those categories:
+
+- `docs/baseline_paper_reported_results.csv` = original paper-reported scale.
+- `results/...` = local unified benchmark results.
+
+Use separate table labels in your manuscript: **paper-reported**, **paper-guided reproduction**, and **unified benchmark**.
+
+## Original vs adapted baseline modes
+
+```bash
+# Exact paper-reported tables copied from the four papers
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src python main.py \
+  --methods baselines \
+  --baseline-mode original \
+  --output results/original_reported
+
+# Local unified benchmark on your input data
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src python main.py \
+  --methods baselines,proposal \
+  --baseline-mode adapt \
+  --attack-preset lite \
+  --output results/adapt_lite
+```
+
+`original` writes paper-reported tables. `adapt` is the actual runnable comparison on your dataset. Keep them separate in the manuscript. See `docs/ORIGINAL_VS_ADAPT_MODES.md`.
+
+---
+
+## Proposal two-phase workflow
+
+The proposal method now supports the requested two phases.
+
+### Phase 1 — optimization phase
+
+This phase runs the Firefly parameter search and exports a parameter file.
+Only the four source-script parameters are optimized:
+
+```text
+Q4_TAU, Q4_MARGIN, H01_Q, H01_MARGIN
+```
+
+Example quick optimization:
 
 ```bash
 OPENBLAS_NUM_THREADS=1 PYTHONPATH=src python main.py \
-  --methods proposal \
-  --proposal-use-optimizer \
-  --proposal-optimizer-trials 4 \
-  --proposal-repeat 3 \
+  --phase optimize \
+  --host-dir data/host \
+  --watermark data/watermark/wm.png \
   --max-images 1 \
-  --output results/proposal_optimizer_demo
+  --proposal-repeat full \
+  --proposal-optimizer-fireflies 4 \
+  --proposal-optimizer-generations 2 \
+  --proposal-optimizer-attack-preset script \
+  --proposal-param-file results/proposal_optimized_params.json
 ```
 
-Use `--proposal-repeat auto` only for proposal-only final experiments because it is much slower.
+The optimization phase writes:
+
+```text
+results/proposal_optimized_params.json
+results/proposal_optimized_params.csv
+```
+
+The JSON contains both per-image optimized parameters and a global best fallback.
+
+### Phase 2 — normal phase
+
+In normal phase, the benchmark checks `--proposal-param-file` automatically.
+If the file exists, it uses the optimized parameters. If the file does not exist,
+it uses the default source-script parameters.
+
+```bash
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src python main.py \
+  --phase normal \
+  --methods proposal \
+  --attack-preset script \
+  --proposal-repeat full \
+  --proposal-param-file results/proposal_optimized_params.json \
+  --output results/proposal_normal_with_optimized_params
+```
+
+Useful parameter-file modes:
+
+```text
+--proposal-param-mode auto      # default: use optimized file if it exists, else defaults
+--proposal-param-mode ignore    # force default parameters
+--proposal-param-mode require   # fail if optimized file is missing
+```
+
+### Attack presets
+
+Available presets are now:
+
+```text
+none    clean extraction only
+lite    quick mixed attack suite
+script  attacks aligned with the standalone Python script
+full    broad attack suite
+stress  compact harsh attack suite
+grid    large parameter sweep with many attack levels
+```
+
+Use `--attack-preset grid` when you want many attack variables for sensitivity testing.
