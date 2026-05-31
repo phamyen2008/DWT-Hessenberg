@@ -300,8 +300,15 @@ def run_benchmark(
 
                 if save_outputs:
                     base = output_dir / "images" / method_id / image_name
-                    save_image(base / "watermarked.png", watermarked)
-                    save_image(base / "extracted_no_attack.png", extracted_clean)
+
+                    # Clean/original host image before embedding.
+                    save_image(base / "host_original.png", host)
+
+                    # Watermarked host image before any attack.
+                    save_image(base / "host_before_attack_watermarked.png", watermarked)
+
+                    # Watermark extracted from the watermarked image before any attack.
+                    save_image(base / "watermark_extracted_before_attack.png", extracted_clean)
 
                 rows.append({
                     "method_id": method_id,
@@ -328,10 +335,13 @@ def run_benchmark(
                         extracted = method.extract(attacked, key, host_rgb=host)
                         extract_time = time.perf_counter() - t2
                         if save_outputs:
-                            base = output_dir / "images" / method_id / image_name
-                            if attack.name in {"jpeg_q70", "jpeg_q90", "gaussian_noise_sigma5", "rotation_2deg", "script_rotation_45deg"}:
-                                save_image(base / f"attacked_{attack.name}.png", attacked)
-                                save_image(base / f"extracted_{attack.name}.png", extracted)
+                            attack_base = output_dir / "images" / method_id / image_name / "attacks" / attack.name
+
+                            # Watermarked host image after this attack.
+                            save_image(attack_base / "host_after_attack.png", attacked)
+
+                            # Watermark extracted after this attack.
+                            save_image(attack_base / "watermark_extracted_after_attack.png", extracted)
                         rows.append({
                             "method_id": method_id,
                             "method_name": method.name,
@@ -631,7 +641,7 @@ def main():
     parser.add_argument("--host-dir", default="data/host")
     parser.add_argument("--watermark", default="data/watermark/wm.png")
     parser.add_argument("--output", default="results/common_benchmark")
-    parser.add_argument("--methods", default="all", help="Comma-separated: all,baselines,kumar2021,guo2017_dwt_qr_fa,gaata2022_dwt_hess_fwa,dwt_hd_svd_2025,proposal")
+    parser.add_argument("--methods", default="all", help="Comma-separated: all,baselines,kumar2021,guo2017_dwt_qr_fa,gaata2022_dwt_hess_fwa,dwt_hd_svd_2025,hess_nha2023,roy2018_dwt_svd,proposal")
     parser.add_argument("--max-images", type=int, default=None, help="Optional quick-run limit.")
     parser.add_argument("--no-save-images", action="store_true")
     parser.add_argument("--invert-watermark", action="store_true")
@@ -641,6 +651,8 @@ def main():
     parser.add_argument("--guo-mode", default="inherit", choices=["inherit", "adapt", "original", "original-rerun"])
     parser.add_argument("--gaata-mode", default="inherit", choices=["inherit", "adapt", "original", "original-rerun"])
     parser.add_argument("--dwt-hd-svd-mode", default="inherit", choices=["inherit", "adapt", "original", "original-rerun"])
+    parser.add_argument("--hess-nha-mode", default="inherit", choices=["inherit", "adapt", "paper", "original", "original-rerun"], help="Hess-Nha2023 mode: adapt uses T=15 for 64x64; paper/original-rerun uses T=65 with 64x64 tiling.")
+    parser.add_argument("--roy-mode", default="inherit", choices=["inherit", "adapt", "original", "original-rerun"], help="Roy2018 mode: adapt/original-rerun run the local DWT-SVD baseline; original writes paper-reported rows.")
 
     parser.add_argument("--guo-param-file", default=DEFAULT_GUO_PARAM_FILE, help="JSON file written by Guo Firefly optimization phase. Normal phase loads it automatically when it exists.")
     parser.add_argument("--guo-param-mode", default="auto", choices=["auto", "ignore", "require"], help="auto: use Guo lambda file if present; ignore: fixed/default lambda; require: fail if missing.")
@@ -730,6 +742,8 @@ def main():
         "guo2017_dwt_qr_fa": _mode(args.guo_mode),
         "gaata2022_dwt_hess_fwa": _mode(args.gaata_mode),
         "dwt_hd_svd_2025": _mode(args.dwt_hd_svd_mode),
+        "hess_nha2023": _mode(args.hess_nha_mode),
+        "roy2018_dwt_svd": _mode(args.roy_mode),
     }
 
     guo_optimized_payload = None
