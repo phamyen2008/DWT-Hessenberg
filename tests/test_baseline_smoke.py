@@ -18,9 +18,15 @@ def test_four_requested_baselines_clean_smoke():
         assert watermarked.shape == host.shape, method_id
         assert extracted.shape == wm.shape, method_id
         assert psnr(host, watermarked) > 30.0, method_id
-        # Gaata's published decimal/parity rule is quantization-sensitive, so its
-        # Python reproduction has a looser clean BER threshold than the others.
-        assert ber(wm, extracted) < (0.10 if method_id == "gaata2022_dwt_hess_fwa" else 0.03 if method_id == "roy2018_dwt_svd" else 0.02), method_id
+        # Gaata adapt mode now uses a quantization-aware Hessenberg parity rule
+        # so the watermark survives the same uint8 reconstruction pipeline as the
+        # other local baselines.
+        if method_id == "gaata2022_dwt_hess_fwa":
+            assert getattr(method.config, "decimal_position") == 3
+            assert getattr(method.config, "embedding_rule") == "qim"
+            assert ber(wm, extracted) < 0.02, method_id
+        else:
+            assert ber(wm, extracted) < (0.03 if method_id == "roy2018_dwt_svd" else 0.02), method_id
 
 
 def test_roy2018_matches_paper_structure_and_clean_result():

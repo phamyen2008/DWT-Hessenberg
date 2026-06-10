@@ -307,3 +307,21 @@ grid    large parameter sweep with many attack levels
 ```
 
 Use `--attack-preset grid` when you want many attack variables for sensitivity testing.
+
+### add 
+### dwt-QR-FA
+### phase 1
+python main.py  --phase optimize   --methods guo2017_dwt_qr_fa   --max-images 1   --guo-optimizer-fireflies 4   --guo-optimizer-generations 2   --guo-optimizer-attack-preset script
+
+### phase 2
+
+  python main.py   --methods guo2017_dwt_qr_fa   --attack-preset full   --guo-param-mode require   --guo-param-file results/guo2017_lambda.json  --output results/guo2017_full_optimized
+
+### Gaata DWT_hess 2022
+### phase 1
+python main.py   --phase optimize   --methods gaata2022_dwt_hess_fwa   --host-dir data/host   --watermark data/watermark/wm.png   --gaata-param-file results/gaata2022_key_params.json   --gaata-optimizer-population 8   --gaata-optimizer-iterations 3   --gaata-optimizer-sparks 3
+### phase 2
+python main.py  --phase normal   --methods gaata2022_dwt_hess_fwa   --host-dir data/host   --watermark data/watermark/wm.png   --attack-preset requested   --gaata-param-mode require   --gaata-param-file results/gaata2022_key_params.json   --output results/gaata2022_requested_optimized
+
+### vẽ biểu đồ
+  python main.py   --phase proposal-plot   --host-dir data/host   --watermark data/watermark/wm.png --output results/proposal_plot_dense   --proposal-plot-hosts airplane.bmp,Girl.bmp,house.bmp,milkdrop.bmp,safari.bmp,tiffany.bmp
