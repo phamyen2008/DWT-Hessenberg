@@ -1,5 +1,32 @@
 # WatermarkLab cleaned baseline project
 
+## Updated 9-training / 12-testing host protocol
+
+**Train/tune on the nine newly uploaded 512x512 RGB BMP images in `data/host_train/`; test on all twelve original (non-Lenna) host images in `data/host/`.** The three previous tuning hosts (`baboon.bmp`, `safari.bmp`, `sailboat.bmp`) are now included in testing. `lenna.bmp` stays excluded. Neither the proposed method nor the baseline algorithms are changed.
+
+```bash
+python -m watermarklab.experiments.splits --host-dir data/host --output results/final_9_12/split.json --create-dirs
+python -m pytest -q tests/test_dataset_9_train_12_test.py
+```
+
+See **[`docs/DATASET_SPLIT_9TRAIN_12TEST.md`](docs/DATASET_SPLIT_9TRAIN_12TEST.md)** for complete image lists, reproduction instructions, and rerun requirements.
+
+
+## Added baselines: Abodena2022 and Su2016
+
+Two additional **blind**, paper-guided 4096-bit baselines are registered:
+`abodena2022_lwt_dct_hess` (LWT-DCT-Hessenberg, 2022) and
+`su2016_contourlet_hess` (Contourlet-LP-Hessenberg, 2016).
+They operate on the original 64x64 binary watermark and use the same 512x512
+RGB host set, attacks, and metrics as existing methods. Neither one changes
+`proposal_qh_dwt_hess.py`. See `docs/BASELINE_METHODS.md` for the specific
+published-algorithm differences and reproducibility limitations.
+
+```bash
+python main.py --methods abodena2022_lwt_dct_hess,su2016_contourlet_hess --max-images 2 --attack-preset lite --output results/hessenberg_new
+python -m pytest -q tests/test_paper_hess_baselines_2016_2022.py
+```
+
 This is the cleaned version of your watermarking project. It keeps only:
 
 1. **Paper 1 — Kumar 2021**: DWT + maximum entropy + alpha blending.
@@ -132,6 +159,10 @@ gaata2022_dwt_hess_fwa
 dwt_hd_svd_2025
 hess_nha2023
 roy2018_dwt_svd
+dwt_wht_svd_2024
+qwt_qsvd_zhang2022_blind
+qwt_qsvd_zhang2022_semiblind
+zhu2021_iwt_svd_adapted
 proposal
 baselines
 all
@@ -308,20 +339,90 @@ grid    large parameter sweep with many attack levels
 
 Use `--attack-preset grid` when you want many attack variables for sensitivity testing.
 
-### add 
-### dwt-QR-FA
-### phase 1
-python main.py  --phase optimize   --methods guo2017_dwt_qr_fa   --max-images 1   --guo-optimizer-fireflies 4   --guo-optimizer-generations 2   --guo-optimizer-attack-preset script
 
-### phase 2
+## Proposal size sweep command
 
-  python main.py   --methods guo2017_dwt_qr_fa   --attack-preset full   --guo-param-mode require   --guo-param-file results/guo2017_lambda.json  --output results/guo2017_full_optimized
+Run the proposal method with several host and watermark sizes without modifying `data/`:
 
-### Gaata DWT_hess 2022
-### phase 1
-python main.py   --phase optimize   --methods gaata2022_dwt_hess_fwa   --host-dir data/host   --watermark data/watermark/wm.png   --gaata-param-file results/gaata2022_key_params.json   --gaata-optimizer-population 8   --gaata-optimizer-iterations 3   --gaata-optimizer-sparks 3
-### phase 2
-python main.py  --phase normal   --methods gaata2022_dwt_hess_fwa   --host-dir data/host   --watermark data/watermark/wm.png   --attack-preset requested   --gaata-param-mode require   --gaata-param-file results/gaata2022_key_params.json   --output results/gaata2022_requested_optimized
+```bash
+python main.py \
+  --phase proposal-size-sweep \
+  --host-dir data/host \
+  --watermark data/watermark/wm.png \
+  --output results/proposal_size_sweep \
+  --attack-preset lite \
+  --size-sweep-host-sizes 256,512,1024 \
+  --size-sweep-watermark-sizes 32,64,128 \
+  --proposal-param-mode ignore
+```
 
-### vẽ biểu đồ
-  python main.py   --phase proposal-plot   --host-dir data/host   --watermark data/watermark/wm.png --output results/proposal_plot_dense   --proposal-plot-hosts airplane.bmp,Girl.bmp,house.bmp,milkdrop.bmp,safari.bmp,tiffany.bmp
+The command writes CSV files and plots for clean PSNR before attack and NC after attack into the selected output folder.
+
+---
+
+## Proposal Tier-1 hyperparameter sweep command
+
+Run a grid sweep over the four proposal parameters that directly control the robustness/imperceptibility trade-off:
+
+```text
+q4_tau
+q4_margin
+h01_q
+h01_margin
+```
+
+Default sweep grid:
+
+```text
+q4_tau:     0.35,0.40,0.45,0.50,0.55,0.60,0.65
+q4_margin:  0.04,0.06,0.08,0.10,0.12,0.14
+h01_q:      5,6,7,8,9,10
+h01_margin: 0.50,0.70,0.90,1.10,1.20
+```
+
+Full default command:
+
+```bash
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src python main.py \
+  --phase proposal-hparam-sweep \
+  --host-dir data/host \
+  --watermark data/watermark/wm.png \
+  --output results/proposal_hparam_sweep \
+  --attack-preset lite \
+  --proposal-repeat full \
+  --no-save-images \
+  --proposal-param-mode ignore
+```
+
+Quick smoke command:
+
+```bash
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src python main.py \
+  --phase proposal-hparam-sweep \
+  --host-dir data/host \
+  --watermark data/watermark/wm.png \
+  --output results/proposal_hparam_sweep_smoke \
+  --max-images 1 \
+  --attack-preset none \
+  --proposal-repeat 1 \
+  --no-save-images \
+  --hparam-sweep-q4-tau 0.40,0.50 \
+  --hparam-sweep-q4-margin 0.08 \
+  --hparam-sweep-h01-q 7 \
+  --hparam-sweep-h01-margin 0.90 \
+  --proposal-param-mode ignore
+```
+
+The sweep writes:
+
+```text
+proposal_hparam_sweep_per_image_attack_results.csv
+proposal_hparam_sweep_summary_by_combo_phase.csv
+proposal_hparam_sweep_summary_by_combo.csv
+proposal_hparam_sweep_ranking.csv
+proposal_hparam_sweep_best.json
+proposal_hparam_sweep_manifest.csv
+proposal_hparam_sweep_failures.json
+```
+
+The ranking table includes balanced, robustness, and imperceptibility ranks. `h01_margin` is recorded both as requested and effective because the implementation clips it to `h01_margin <= 0.49 * h01_q`.

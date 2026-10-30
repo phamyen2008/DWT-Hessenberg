@@ -1,6 +1,9 @@
 from __future__ import annotations
 import argparse
 import csv
+import hashlib
+import os
+import itertools
 import json
 import time
 from datetime import datetime, timezone
@@ -11,18 +14,66 @@ import numpy as np
 import pandas as pd
 
 from watermarklab.common.io_utils import load_host_rgb, load_watermark_binary, save_image, list_image_files
-from watermarklab.common.attack import default_attack_suite, apply_attack
+from watermarklab.common.attack import default_attack_suite, apply_attack, AttackConfig, manuscript43_family, reviewer45_family
 from watermarklab.common.metrics import psnr, ssim, nc, ncc, ber
 from watermarklab.methods import build_methods, BASELINE_METHOD_IDS
 from watermarklab.methods.guo2017_dwt_qr_fa import Guo2017DWTQRFA
+from watermarklab.methods.gaata2022_dwt_hess_fwa import Gaata2022DWTHessFWA
 from watermarklab.methods.proposal_qh_dwt_hess import ProposalParams, ProposalQHDWTHess, optimization_param_snapshot
+from watermarklab.vendor.dwt_hess_fwa.watermark import WatermarkConfig
+from watermarklab.vendor.dwt_hess_fwa.fwa import optimize_key_params
 from watermarklab.paper_reported import write_paper_reported
+from watermarklab.experiments.partial_results import AttackCheckpoint, fingerprint, file_hash
 
 
 OPT_PARAM_FORMAT = "watermarklab_proposal_optimization_params_v1"
 DEFAULT_PROPOSAL_PARAM_FILE = "results/proposal_optimized_params.json"
 GUO_PARAM_FORMAT = "watermarklab_guo2017_lambda_params_v1"
 DEFAULT_GUO_PARAM_FILE = "results/guo2017_lambda.json"
+GAATA_PARAM_FORMAT = "watermarklab_gaata2022_key_params_v1"
+DEFAULT_GAATA_PARAM_FILE = "results/gaata2022_key_params.json"
+
+
+PROPOSAL_ABLATION_VARIANTS: dict[str, dict[str, Any]] = {
+    "full": {
+        "description": "Full proposal: watermark DWT-LL payload + Arnold scrambling + Q4/H-position adaptive candidates + structured repetition + BSS/MSE selection.",
+        "params": {},
+    },
+    "q4_only": {
+        "description": "Disable the H-position branch; keep only the Q4/Hessenberg-Q candidate.",
+        "params": {"hpos_enabled": False},
+    },
+    "hpos_only": {
+        "description": "Disable the Q4 branch; keep only H-position quantization candidates.",
+        "params": {"q4_enabled": False},
+    },
+    "no_structured_repetition": {
+        "description": "Disable repeated embedding/majority voting by using only one block per payload bit.",
+        "params": {"structured_repetition_enabled": False, "repeat": 1},
+    },
+    "no_watermark_dwt": {
+        "description": "Disable watermark DWT-LL payload compression and embed the full 64x64 binary watermark directly.",
+        "params": {"watermark_dwt_enabled": False},
+    },
+    "no_arnold": {
+        "description": "Disable Arnold scrambling while keeping the same payload domain.",
+        "params": {"arnold_enabled": False, "arnold_iterations": 0},
+    },
+    "mse_only_selection": {
+        "description": "Use lowest-MSE candidate selection among valid candidates instead of the weighted BSS/MSE score.",
+        "params": {"candidate_selection_mode": "mse_only"},
+    },
+    "bss_only_selection": {
+        "description": "Use BSS/survival-rate-only candidate selection instead of the weighted BSS/MSE score.",
+        "params": {"candidate_selection_mode": "bss_only"},
+    },
+    "no_strength_filter": {
+        "description": "Select from all candidates without the strong-candidate survival/MSE filter.",
+        "params": {"candidate_selection_mode": "no_strength_filter"},
+    },
+}
+
+DEFAULT_PROPOSAL_ABLATION_VARIANTS = ",".join(PROPOSAL_ABLATION_VARIANTS.keys())
 
 
 def _safe_num(x):
@@ -188,20 +239,103 @@ def _select_guo_lambda_for_image(host_path: Path, loaded_payload: dict[str, Any]
     return None, "default"
 
 
+def load_gaata_param_file(path: str | Path) -> dict[str, Any]:
+    """Load optimized Gaata 2022 chaotic key parameters if present."""
+    path = Path(path)
+    if not path.exists():
+        return {"loaded": False, "path": str(path), "reason": "file_not_found", "per_image": {}, "global_key_params": None}
+
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    per_image: dict[str, tuple[float, float, float, float]] = {}
+    global_key_params: tuple[float, float, float, float] | None = None
+
+    def _coerce_params(value: Any) -> tuple[float, float, float, float] | None:
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            # Support either {"key_params": [...]} or named x0/y0/r/b keys.
+            if "key_params" in value:
+                return _coerce_params(value["key_params"])
+            names = ["x0", "y0", "r", "b"]
+            if all(k in value for k in names):
+                return tuple(float(value[k]) for k in names)  # type: ignore[return-value]
+            if "best_params" in value:
+                return _coerce_params(value["best_params"])
+        if isinstance(value, (list, tuple)) and len(value) == 4:
+            return tuple(float(v) for v in value)  # type: ignore[return-value]
+        return None
+
+    if isinstance(raw, dict) and raw.get("format") == GAATA_PARAM_FORMAT:
+        gb = raw.get("global_best") or {}
+        global_key_params = _coerce_params(gb)
+        for key, rec in dict(raw.get("per_image", {})).items():
+            params = _coerce_params(rec)
+            if params is not None:
+                per_image[str(key)] = params
+                if isinstance(rec, dict) and rec.get("filename"):
+                    per_image[str(rec["filename"])] = params
+    elif isinstance(raw, dict):
+        global_key_params = _coerce_params(raw)
+
+    return {
+        "loaded": bool(global_key_params is not None or per_image),
+        "path": str(path),
+        "per_image": per_image,
+        "global_key_params": global_key_params,
+        "raw_format": raw.get("format") if isinstance(raw, dict) else type(raw).__name__,
+    }
+
+
+def _select_gaata_key_params_for_image(host_path: Path, loaded_payload: dict[str, Any] | None,
+                                       *, allow_per_image: bool = False) -> tuple[tuple[float, float, float, float] | None, str]:
+    if not loaded_payload or not loaded_payload.get("loaded"):
+        return None, "default"
+    # Frozen GLOBAL parameters first: per-host tuning on held-out images
+    # leaks test-host information into the comparison. Optional override is
+    # only for explicitly labeled diagnostic/legacy experiments.
+    if loaded_payload.get("global_key_params") is not None and not allow_per_image:
+        return tuple(float(v) for v in loaded_payload["global_key_params"]), f"optimized:{loaded_payload.get('path')}:global_frozen"
+    if allow_per_image:
+        per_image = dict(loaded_payload.get("per_image", {}))
+        for key in [host_path.name, host_path.stem, str(host_path)]:
+            if key in per_image:
+                return tuple(float(v) for v in per_image[key]), f"exploratory_per_host:{loaded_payload.get('path')}:{key}"
+    if loaded_payload.get("global_key_params") is not None:
+        return tuple(float(v) for v in loaded_payload["global_key_params"]), f"optimized:{loaded_payload.get('path')}:global_frozen"
+    return None, "default_no_frozen_training_params"
+
+
+def _restore_ablation_overrides(params: ProposalParams, requested: ProposalParams) -> ProposalParams:
+    """Optimization is fitted on the full proposal, not on ablation switches.
+
+    Saved snapshots contain full-model flags. Apply the variant's explicit overrides
+    *after* loading optimized numerical parameters, or every ablation runs as full.
+    This preserves full-model behavior exactly when ablation_name == 'full'.
+    """
+    name = str(requested.ablation_name)
+    if name not in PROPOSAL_ABLATION_VARIANTS:
+        raise ValueError(f"Unknown recorded ablation: {name}")
+    if name == "full":
+        return params
+    merged = params.to_dict()
+    merged.update(PROPOSAL_ABLATION_VARIANTS[name]["params"])
+    merged["ablation_name"] = name
+    return ProposalParams.from_dict(merged)
+
+
 def _select_proposal_params_for_image(host_path: Path, base_params: ProposalParams, loaded_payload: dict[str, Any] | None):
     if not loaded_payload or not loaded_payload.get("loaded"):
         return ProposalParams.from_dict(base_params.to_dict()), "default"
-    per_image = dict(loaded_payload.get("per_image", {}))
-    for key in [host_path.name, host_path.stem, str(host_path)]:
-        if key in per_image:
-            merged = base_params.to_dict()
-            merged.update(per_image[key])
-            return ProposalParams.from_dict(merged), f"optimized:{loaded_payload.get('path')}:{key}"
+    # Never select per-test-host optimized parameters when a frozen training-
+    # only global configuration exists. Otherwise a held-out run can leak
+    # test-host information despite advertising the same parameters.
     if loaded_payload.get("global_params"):
         merged = base_params.to_dict()
         merged.update(loaded_payload["global_params"])
-        return ProposalParams.from_dict(merged), f"optimized:{loaded_payload.get('path')}:global"
-    return ProposalParams.from_dict(base_params.to_dict()), "default"
+        return _restore_ablation_overrides(ProposalParams.from_dict(merged), base_params), f"optimized:{loaded_payload.get('path')}:global_frozen"
+    return ProposalParams.from_dict(base_params.to_dict()), "default_no_global_config"
 
 
 def run_benchmark(
@@ -216,6 +350,8 @@ def run_benchmark(
     proposal_options: dict[str, Any] | None = None,
     baseline_modes: dict[str, str] | None = None,
     guo_options: dict[str, Any] | None = None,
+    gaata_options: dict[str, Any] | None = None,
+    resume_attacks: bool = False,
 ):
     host_dir = Path(host_dir)
     output_dir = Path(output_dir)
@@ -223,8 +359,10 @@ def run_benchmark(
     baseline_modes = dict(baseline_modes or {})
     proposal_options = dict(proposal_options or {})
     guo_options = dict(guo_options or {})
+    gaata_options = dict(gaata_options or {})
     optimized_payload = proposal_options.pop("optimized_payload", None)
     guo_optimized_payload = guo_options.pop("optimized_payload", None)
+    gaata_optimized_payload = gaata_options.pop("optimized_payload", None)
 
     if selected_methods == ["baselines"]:
         selected_methods = list(BASELINE_METHOD_IDS)
@@ -239,7 +377,13 @@ def run_benchmark(
         return {"results": pd.DataFrame(), "summary": pd.DataFrame(), "comparison": pd.DataFrame(), "failures": [], "reported_methods": original_report_methods}
 
     runtime_baseline_modes = {m: mode for m, mode in baseline_modes.items() if mode != "original"}
-    methods = build_methods(runtime_selected, proposal_options=proposal_options, baseline_modes=runtime_baseline_modes, guo_options=guo_options)
+    methods = build_methods(
+        runtime_selected,
+        proposal_options=proposal_options,
+        baseline_modes=runtime_baseline_modes,
+        guo_options=guo_options,
+        gaata_options=gaata_options,
+    )
     host_paths = list_image_files(host_dir)
     if max_images is not None:
         host_paths = host_paths[: int(max_images)]
@@ -258,7 +402,13 @@ def run_benchmark(
             host = load_host_rgb(host_path)
             param_source = "not_proposal"
             guo_param_source = "not_guo"
+            gaata_param_source = "not_gaata"
             try:
+                if method_id == "gaata2022_dwt_hess_fwa" and isinstance(method, Gaata2022DWTHessFWA):
+                    selected_key_params, gaata_param_source = _select_gaata_key_params_for_image(host_path, gaata_optimized_payload)
+                    if selected_key_params is not None:
+                        method.config = WatermarkConfig(**{**method.config.__dict__, "key_params": selected_key_params})
+
                 if method_id == "guo2017_dwt_qr_fa" and isinstance(method, Guo2017DWTQRFA):
                     selected_lambda, guo_param_source = _select_guo_lambda_for_image(host_path, guo_optimized_payload)
                     if selected_lambda is not None:
@@ -278,7 +428,31 @@ def run_benchmark(
                 extracted_clean = method.extract(watermarked, key, host_rgb=host)
                 extract_clean_time = time.perf_counter() - t1
 
-                key_info = {"proposal_param_source": param_source} if method_id == "proposal" else {}
+                key_info = {"proposal_param_source": param_source, "proposal_block_size": int(key.params.block_size), "proposal_effective_configuration": json.dumps(key.params.to_dict(), sort_keys=True, default=_json_default)} if method_id == "proposal" else {}
+                if method_id in {"abodena2022_lwt_dct_hess", "su2016_contourlet_hess"}:
+                    key_info["baseline_protocol"] = "paper_guided_4096_bit_adaptation"
+                    key_info["baseline_payload_bits"] = int(watermark.size)
+                    key_info["baseline_extraction_type"] = "blind"
+                    key_info["baseline_carrier"] = str(key.channel)
+                    key_info["baseline_mode"] = str(key.mode)
+                    key_info["baseline_quantization_parameter"] = float(getattr(key, "alpha", getattr(key, "step", 0.0)))
+                    key_info["baseline_lwt_levels"] = int(key.levels) if hasattr(key, "levels") else None
+                if method_id == "gaata2022_dwt_hess_fwa" and isinstance(method, Gaata2022DWTHessFWA):
+                    key_info["gaata_param_source"] = gaata_param_source
+                    key_info["gaata_decimal_position"] = int(method.config.decimal_position)
+                    key_info["gaata_key_strength"] = float(method.config.key_strength)
+                    key_info["gaata_key_params"] = json.dumps(list(method.config.key_params))
+                    key_info["gaata_embedding_rule"] = str(getattr(method.config, "embedding_rule", "decimal"))
+                    key_info["gaata_qim_step"] = float(getattr(method.config, "qim_step", 16.0))
+                    key_info["gaata_use_fwa_inline"] = bool(method.use_fwa)
+                    key_info["gaata_protocol"] = ("paper_guided_decimal" if method.config.embedding_rule == "decimal"
+                                                  else "4096_bit_uint8_qim_adaptation")
+                    if method.config.embedding_rule == "decimal":
+                        # Diagnostic only. Do not replace reported uint8 BER
+                        # with near-perfect scores from an unsaved float image.
+                        float_decoded = method.extract_exact_float(key)
+                        key_info["gaata_clean_ber_float"] = float(ber(watermark, float_decoded))
+                        key_info["gaata_clean_ber_uint8"] = float(ber(watermark, extracted_clean))
                 if method_id == "guo2017_dwt_qr_fa" and isinstance(method, Guo2017DWTQRFA):
                     key_info["guo_param_source"] = guo_param_source
                     key_info["guo_lambda_strength"] = float(method.lambda_strength)
@@ -297,6 +471,30 @@ def run_benchmark(
                         key_info["proposal_h01_q"] = float(key.params.h01_q)
                         key_info["proposal_h01_margin"] = float(key.params.h01_margin)
                         key_info["proposal_dwt_mode"] = str(key.params.dwt_mode)
+                        key_info["proposal_ablation"] = str(getattr(key.params, "ablation_name", "full"))
+                        key_info["proposal_q4_enabled"] = bool(getattr(key.params, "q4_enabled", True))
+                        key_info["proposal_hpos_enabled"] = bool(getattr(key.params, "hpos_enabled", True))
+                        key_info["proposal_arnold_enabled"] = bool(getattr(key.params, "arnold_enabled", True))
+                        key_info["proposal_watermark_dwt_enabled"] = bool(getattr(key.params, "watermark_dwt_enabled", True))
+                        key_info["proposal_structured_repetition_enabled"] = bool(getattr(key.params, "structured_repetition_enabled", True))
+                        key_info["proposal_candidate_selection_mode"] = str(getattr(key.params, "candidate_selection_mode", "bss_mse"))
+
+                attack_cache = None
+                if resume_attacks:
+                    # Include the source, host, watermark, selected method settings,
+                    # whole attack grid and frozen optimized parameters. The
+                    # reconstructed marked-image hash is checked separately.
+                    attack_cache = AttackCheckpoint(
+                        output_dir / "attack_progress" / method_id / (image_name + ".json"),
+                        fingerprint("normal_v2", file_hash(__file__),
+                                    file_hash(host_path), file_hash(watermark_path),
+                                    method_id, attack_preset, invert_watermark,
+                                    [(a.name, a.group, a.params) for a in attacks],
+                                    proposal_options, guo_options, gaata_options,
+                                    runtime_baseline_modes, key_info),
+                        numeric_columns=("psnr", "ssim", "nc", "ber", "embed_time_sec", "extract_time_sec"),
+                    )
+                    attack_cache.prepare(watermarked)
 
                 if save_outputs:
                     base = output_dir / "images" / method_id / image_name
@@ -310,7 +508,7 @@ def run_benchmark(
                     # Watermark extracted from the watermarked image before any attack.
                     save_image(base / "watermark_extracted_before_attack.png", extracted_clean)
 
-                rows.append({
+                clean_row = {
                     "method_id": method_id,
                     "method_name": method.name,
                     "image": image_name,
@@ -324,11 +522,21 @@ def run_benchmark(
                     "embed_time_sec": embed_time,
                     "extract_time_sec": extract_clean_time,
                     **key_info,
-                })
+                }
+                if attack_cache:
+                    # Keep original measured timings from the checkpoint.
+                    clean_row = attack_cache.clean() or clean_row
+                    attack_cache.set_clean(clean_row)
+                rows.append(clean_row)
 
                 for attack in attacks:
                     if attack.name == "no_attack":
                         continue
+                    if attack_cache:
+                        previous = attack_cache.attack(attack.name)
+                        if previous is not None:
+                            rows.append(previous)
+                            continue
                     try:
                         attacked = apply_attack(watermarked, attack)
                         t2 = time.perf_counter()
@@ -342,7 +550,7 @@ def run_benchmark(
 
                             # Watermark extracted after this attack.
                             save_image(attack_base / "watermark_extracted_after_attack.png", extracted)
-                        rows.append({
+                        attack_row = {
                             "method_id": method_id,
                             "method_name": method.name,
                             "image": image_name,
@@ -356,7 +564,10 @@ def run_benchmark(
                             "embed_time_sec": embed_time,
                             "extract_time_sec": extract_time,
                             **key_info,
-                        })
+                        }
+                        rows.append(attack_row)
+                        if attack_cache:
+                            attack_cache.set_attack(attack.name, attack_row)
                     except Exception as e:
                         failures.append({"method_id": method_id, "image": image_name, "attack": attack.name, "error": repr(e)})
             except Exception as e:
@@ -433,12 +644,47 @@ def run_proposal_optimization_phase(
     attack_suite = default_attack_suite(include_none=False, preset=attack_preset)
     base_params = ProposalParams.from_dict({"repeat": repeat})
 
-    per_image: dict[str, Any] = {}
-    rows: list[dict[str, Any]] = []
+    # Persist each expensive calculation immediately. Checkpoints are tied to
+    # byte-identical training images, watermark and optimizer settings: no
+    # accidental reuse of parameters from a different training protocol.
+    contract = {
+        "files": {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                  for p in [*host_paths, Path(watermark_path)]},
+        "repeat": "full" if repeat is None else int(repeat),
+        "invert_watermark": bool(invert_watermark),
+        "attack_preset": str(attack_preset),
+        "n_fireflies": n_fireflies, "n_generations": n_generations,
+        "alpha": alpha, "beta0": beta0, "gamma": gamma,
+        "alpha_decay": alpha_decay, "seed": seed,
+    }
+    fingerprint = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
+    progress_file = output_file.with_name(output_file.stem + ".progress.json")
+    if progress_file.exists():
+        progress = json.loads(progress_file.read_text(encoding="utf-8"))
+        if progress.get("fingerprint") != fingerprint:
+            raise ValueError(f"Existing optimization checkpoint uses a different input/configuration: {progress_file}. "
+                             "Use the original protocol or a new --proposal-param-file path.")
+    else:
+        progress = {"fingerprint": fingerprint, "contract": contract,
+                    "per_image": {}, "rows": [], "selection": {}}
+
+    def checkpoint():
+        tmp = progress_file.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(progress, f, indent=2, ensure_ascii=False, default=_json_default)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, progress_file)
+
+    per_image: dict[str, Any] = dict(progress["per_image"])
+    rows: list[dict[str, Any]] = list(progress["rows"])
     global_best: dict[str, Any] | None = None
     global_best_obj = -1e18
 
     for idx, host_path in enumerate(host_paths):
+        if host_path.stem in per_image:
+            print(f"[OPT RESUME] {host_path.name}: cached", flush=True)
+            continue
         host = load_host_rgb(host_path)
         method = ProposalQHDWTHess(params=base_params, use_optimizer=False, optimizer_trials=n_fireflies, optimizer_seed=seed + idx * 100000)
         best_params, record = method.optimize_params(
@@ -490,10 +736,44 @@ def run_proposal_optimization_phase(
             "h01_margin": float(best_params.h01_margin),
         }
         rows.append(row)
+        progress["per_image"] = per_image
+        progress["rows"] = rows
+        checkpoint()
         print(f"[OPT] {host_path.name}: objective={objective:.6f}, q4_tau={best_params.q4_tau:.6f}, q4_margin={best_params.q4_margin:.6f}, h01_q={best_params.h01_q:.6f}, h01_margin={best_params.h01_margin:.6f}")
+
+    # One frozen configuration for *all* held-out images. Select among the
+    # configurations discovered on training hosts by their mean training
+    # objective, rather than taking the largest score from one lucky host.
+    candidate_selection: list[dict[str, Any]] = []
+    for candidate_host in host_paths:
+        candidate_entry = per_image[candidate_host.stem]
+        candidate_params = ProposalParams.from_dict(candidate_entry["params"])
+        # Checkpoint after EVERY candidate/host comparison (81 in total).
+        # These evaluations are the expensive part after the initial 9 searches.
+        outcomes = list(progress["selection"].get(candidate_host.name, []))
+        if len(outcomes) > len(host_paths):
+            raise ValueError("Corrupt candidate-selection checkpoint")
+        evaluator = ProposalQHDWTHess(params=candidate_params, use_optimizer=False)
+        for train_host in host_paths[len(outcomes):]:
+            measure = evaluator._evaluate_params_for_optimization(
+                load_host_rgb(train_host), watermark, candidate_params, attack_suite=attack_suite)
+            outcomes.append(float(measure.get("objective", -1e9)))
+            progress["selection"][candidate_host.name] = outcomes
+            checkpoint()
+            print(f"[OPT SELECT] {candidate_host.name} x {train_host.name}: "
+                  f"{len(outcomes)}/{len(host_paths)}", flush=True)
+        candidate_selection.append({"candidate_source": candidate_host.name,
+            "train_host_objectives": outcomes, "mean_train_objective": float(np.mean(outcomes)),
+            "params": candidate_params.to_dict()})
+    winner = max(candidate_selection, key=lambda x:x["mean_train_objective"])
+    global_best = {"image":winner["candidate_source"],"filename":winner["candidate_source"],
+                   "params":winner["params"],"objective":winner["mean_train_objective"],
+                   "selection_rule":"maximum mean objective across all training hosts"}
 
     payload = {
         "format": OPT_PARAM_FORMAT,
+        "optimization_contract_sha256": fingerprint,
+        "training_selection":candidate_selection,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "host_dir": str(host_dir),
         "watermark_path": str(watermark_path),
@@ -503,8 +783,12 @@ def run_proposal_optimization_phase(
         "global_best": global_best,
         "per_image": per_image,
     }
-    with open(output_file, "w", encoding="utf-8") as f:
+    tmp_final = output_file.with_suffix(".json.tmp")
+    with tmp_final.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False, default=_json_default)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_final, output_file)
 
     csv_path = output_file.with_suffix(".csv")
     if rows:
@@ -517,6 +801,554 @@ def run_proposal_optimization_phase(
     print(f"Saved optimized proposal parameter CSV to: {csv_path}")
     return payload
 
+
+
+def _format_hparam_combo_id(index: int, params: ProposalParams) -> str:
+    """Stable, filesystem-safe ID for one Tier-1 proposal hyperparameter setting."""
+    return (
+        f"combo_{int(index):04d}"
+        f"__q4tau_{float(params.q4_tau):.3f}".replace(".", "p")
+        + f"__q4margin_{float(params.q4_margin):.3f}".replace(".", "p")
+        + f"__h01q_{float(params.h01_q):.3f}".replace(".", "p")
+        + f"__h01margin_{float(params.h01_margin):.3f}".replace(".", "p")
+    )
+
+
+def _summarize_proposal_hparam_sweep(all_results: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Create phase-level summary, compact combo summary, and ranking table."""
+    if all_results.empty:
+        empty = pd.DataFrame()
+        return empty, empty, empty
+
+    group_cols = [
+        "sweep_combo_id",
+        "sweep_index",
+        "q4_tau_requested",
+        "q4_margin_requested",
+        "h01_q_requested",
+        "h01_margin_requested",
+        "q4_tau_effective",
+        "q4_margin_effective",
+        "h01_q_effective",
+        "h01_margin_effective",
+        "phase",
+    ]
+    summary = (
+        all_results.groupby(group_cols, dropna=False)
+        .agg(
+            psnr_mean=("psnr", "mean"),
+            ssim_mean=("ssim", "mean"),
+            nc_mean=("nc", "mean"),
+            ncc_mean=("ncc", "mean"),
+            ber_mean=("ber", "mean"),
+            psnr_std=("psnr", "std"),
+            nc_min=("nc", "min"),
+            ber_max=("ber", "max"),
+            images=("image", "nunique"),
+            rows=("image", "count"),
+            embed_time_mean_sec=("embed_time_sec", "mean"),
+            extract_time_mean_sec=("extract_time_sec", "mean"),
+            repeat_factor_mean=("proposal_repeat_factor", "mean"),
+            q4_used_mean=("proposal_q4_used", "mean"),
+            h_used_mean=("proposal_h_used", "mean"),
+            skip_used_mean=("proposal_skip_used", "mean"),
+        )
+        .reset_index()
+    )
+
+    id_cols = [c for c in group_cols if c != "phase"]
+    clean = summary[summary["phase"] == "before_attack"].copy()
+    attack = summary[summary["phase"] == "after_attack"].copy()
+
+    if not clean.empty:
+        clean = clean.rename(
+            columns={
+                "psnr_mean": "clean_psnr_mean",
+                "ssim_mean": "clean_ssim_mean",
+                "nc_mean": "clean_nc_mean",
+                "ncc_mean": "clean_ncc_mean",
+                "ber_mean": "clean_ber_mean",
+                "nc_min": "clean_nc_min",
+                "ber_max": "clean_ber_max",
+                "rows": "clean_rows",
+            }
+        )
+        keep_clean = id_cols + [
+            "clean_psnr_mean",
+            "clean_ssim_mean",
+            "clean_nc_mean",
+            "clean_ncc_mean",
+            "clean_ber_mean",
+            "clean_nc_min",
+            "clean_ber_max",
+            "clean_rows",
+            "images",
+            "embed_time_mean_sec",
+            "extract_time_mean_sec",
+            "repeat_factor_mean",
+            "q4_used_mean",
+            "h_used_mean",
+            "skip_used_mean",
+        ]
+        clean = clean[[c for c in keep_clean if c in clean.columns]]
+
+    if not attack.empty:
+        attack = attack.rename(
+            columns={
+                "psnr_mean": "mean_attack_psnr",
+                "ssim_mean": "mean_attack_ssim",
+                "nc_mean": "mean_attack_nc",
+                "ncc_mean": "mean_attack_ncc",
+                "ber_mean": "mean_attack_ber",
+                "nc_min": "min_attack_nc",
+                "ber_max": "max_attack_ber",
+                "rows": "attack_rows",
+            }
+        )
+        keep_attack = id_cols + [
+            "mean_attack_psnr",
+            "mean_attack_ssim",
+            "mean_attack_nc",
+            "mean_attack_ncc",
+            "mean_attack_ber",
+            "min_attack_nc",
+            "max_attack_ber",
+            "attack_rows",
+        ]
+        attack = attack[[c for c in keep_attack if c in attack.columns]]
+
+    if clean.empty and attack.empty:
+        combo_summary = pd.DataFrame()
+    elif clean.empty:
+        combo_summary = attack.copy()
+    elif attack.empty:
+        combo_summary = clean.copy()
+        combo_summary["mean_attack_nc"] = np.nan
+        combo_summary["min_attack_nc"] = np.nan
+        combo_summary["mean_attack_ber"] = np.nan
+        combo_summary["max_attack_ber"] = np.nan
+        combo_summary["attack_rows"] = 0
+    else:
+        combo_summary = clean.merge(attack, on=id_cols, how="left")
+
+    if combo_summary.empty:
+        ranking = pd.DataFrame()
+    else:
+        ranking = combo_summary.copy()
+        for col in ["clean_psnr_mean", "clean_ssim_mean", "clean_nc_mean", "clean_ber_mean", "mean_attack_nc", "mean_attack_ber", "min_attack_nc"]:
+            if col not in ranking.columns:
+                ranking[col] = np.nan
+        # If --attack-preset none is used, rank using clean NC/BER so smoke tests still produce a meaningful table.
+        effective_nc = ranking["mean_attack_nc"].where(ranking["mean_attack_nc"].notna(), ranking["clean_nc_mean"])
+        effective_ber = ranking["mean_attack_ber"].where(ranking["mean_attack_ber"].notna(), ranking["clean_ber_mean"])
+        ranking["balanced_score"] = effective_nc + 0.01 * ranking["clean_psnr_mean"].fillna(0.0) - 0.5 * effective_ber.fillna(1.0)
+        ranking["rank_balanced"] = ranking["balanced_score"].rank(ascending=False, method="min").astype(int)
+        ranking["rank_robustness"] = effective_nc.rank(ascending=False, method="min").astype(int)
+        ranking["rank_imperceptibility"] = ranking["clean_psnr_mean"].rank(ascending=False, method="min").astype(int)
+        ranking = ranking.sort_values(["rank_balanced", "rank_robustness", "rank_imperceptibility", "sweep_index"]).reset_index(drop=True)
+
+    return summary, combo_summary, ranking
+
+
+def run_proposal_hparam_sweep_phase(
+    *,
+    host_dir: str | Path,
+    watermark_path: str | Path,
+    output_dir: str | Path,
+    q4_tau_values: list[float],
+    q4_margin_values: list[float],
+    h01_q_values: list[float],
+    h01_margin_values: list[float],
+    max_images: int | None = None,
+    save_outputs: bool = False,
+    invert_watermark: bool = False,
+    attack_preset: str = "lite",
+    repeat: int | None = None,
+    max_combinations: int | None = None,
+) -> dict[str, Any]:
+    """Grid-sweep the proposal's four Tier-1 robustness/imperceptibility parameters.
+
+    The proposal algorithm is unchanged. Each setting is passed as explicit
+    ProposalParams to the existing benchmark runner. The optimized-parameter
+    JSON is intentionally not loaded here, because this phase is meant to study
+    the default Tier-1 parameter space directly.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not q4_tau_values or not q4_margin_values or not h01_q_values or not h01_margin_values:
+        raise ValueError("All proposal hparam sweep lists must be non-empty.")
+
+    combos = list(itertools.product(q4_tau_values, q4_margin_values, h01_q_values, h01_margin_values))
+    if max_combinations is not None:
+        combos = combos[: int(max_combinations)]
+    if not combos:
+        raise ValueError("No proposal hyperparameter combinations to run.")
+
+    all_results: list[pd.DataFrame] = []
+    all_summaries: list[pd.DataFrame] = []
+    all_comparisons: list[pd.DataFrame] = []
+    failures: list[dict[str, Any]] = []
+    manifest_rows: list[dict[str, Any]] = []
+
+    for idx, (q4_tau, q4_margin, h01_q, h01_margin) in enumerate(combos, start=1):
+        requested_params = {
+            "repeat": repeat,
+            "dwt_mode": "pywt",
+            "q4_tau": float(q4_tau),
+            "q4_margin": float(q4_margin),
+            "h01_q": float(h01_q),
+            "h01_margin": float(h01_margin),
+        }
+        effective_params = ProposalParams.from_dict(requested_params)
+        combo_id = _format_hparam_combo_id(idx, effective_params)
+        combo_out = output_dir / "runs" / combo_id
+        print(
+            "[HPARAM-SWEEP] "
+            f"{idx}/{len(combos)}: "
+            f"q4_tau={effective_params.q4_tau:.4f}, "
+            f"q4_margin={effective_params.q4_margin:.4f}, "
+            f"h01_q={effective_params.h01_q:.4f}, "
+            f"h01_margin={effective_params.h01_margin:.4f}"
+        )
+
+        result = run_benchmark(
+            host_dir=host_dir,
+            watermark_path=watermark_path,
+            output_dir=combo_out,
+            selected_methods=["proposal"],
+            max_images=max_images,
+            save_outputs=save_outputs,
+            invert_watermark=invert_watermark,
+            attack_preset=attack_preset,
+            proposal_options={
+                "use_optimizer": False,
+                "optimizer_trials": 0,
+                "params": effective_params.to_dict(),
+                "optimized_payload": None,
+            },
+            baseline_modes={},
+            guo_options={},
+            gaata_options={},
+            resume_attacks=True,
+        )
+
+        metadata = {
+            "sweep_combo_id": combo_id,
+            "sweep_index": int(idx),
+            "q4_tau_requested": float(q4_tau),
+            "q4_margin_requested": float(q4_margin),
+            "h01_q_requested": float(h01_q),
+            "h01_margin_requested": float(h01_margin),
+            "q4_tau_effective": float(effective_params.q4_tau),
+            "q4_margin_effective": float(effective_params.q4_margin),
+            "h01_q_effective": float(effective_params.h01_q),
+            "h01_margin_effective": float(effective_params.h01_margin),
+            "h01_margin_was_clipped": bool(float(effective_params.h01_margin) != float(h01_margin)),
+            "repeat_requested": "full" if repeat is None else int(repeat),
+        }
+
+        for key in ["results", "summary", "comparison"]:
+            df = result.get(key)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                df = df.copy()
+                for mkey, mval in metadata.items():
+                    df[mkey] = mval
+                if key == "results":
+                    all_results.append(df)
+                elif key == "summary":
+                    all_summaries.append(df)
+                else:
+                    all_comparisons.append(df)
+
+        for rec in result.get("failures", []):
+            rec2 = dict(rec)
+            rec2.update(metadata)
+            failures.append(rec2)
+
+        manifest_rows.append({
+            **metadata,
+            "params_json": json.dumps(effective_params.to_dict(), ensure_ascii=False, default=_json_default),
+            "output_dir": str(combo_out),
+        })
+
+    results_df = pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()
+    raw_summary_df = pd.concat(all_summaries, ignore_index=True) if all_summaries else pd.DataFrame()
+    comparison_df = pd.concat(all_comparisons, ignore_index=True) if all_comparisons else pd.DataFrame()
+    manifest_df = pd.DataFrame(manifest_rows)
+    summary_df, combo_summary_df, ranking_df = _summarize_proposal_hparam_sweep(results_df)
+
+    paths = {
+        "results": output_dir / "proposal_hparam_sweep_per_image_attack_results.csv",
+        "raw_summary": output_dir / "proposal_hparam_sweep_raw_summary_by_method_phase.csv",
+        "summary": output_dir / "proposal_hparam_sweep_summary_by_combo_phase.csv",
+        "combo_summary": output_dir / "proposal_hparam_sweep_summary_by_combo.csv",
+        "ranking": output_dir / "proposal_hparam_sweep_ranking.csv",
+        "comparison": output_dir / "proposal_hparam_sweep_compare_before_after.csv",
+        "manifest": output_dir / "proposal_hparam_sweep_manifest.csv",
+        "failures": output_dir / "proposal_hparam_sweep_failures.json",
+        "best": output_dir / "proposal_hparam_sweep_best.json",
+    }
+    results_df.to_csv(paths["results"], index=False)
+    raw_summary_df.to_csv(paths["raw_summary"], index=False)
+    summary_df.to_csv(paths["summary"], index=False)
+    combo_summary_df.to_csv(paths["combo_summary"], index=False)
+    ranking_df.to_csv(paths["ranking"], index=False)
+    comparison_df.to_csv(paths["comparison"], index=False)
+    manifest_df.to_csv(paths["manifest"], index=False)
+    with open(paths["failures"], "w", encoding="utf-8") as f:
+        json.dump(failures, f, indent=2, ensure_ascii=False, default=_json_default)
+
+    best_payload = {
+        "format": "watermarklab_proposal_hparam_sweep_v1",
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "host_dir": str(host_dir),
+        "watermark_path": str(watermark_path),
+        "attack_preset": str(attack_preset),
+        "repeat": "full" if repeat is None else int(repeat),
+        "total_combinations": int(len(combos)),
+        "default_sweep_values": {
+            "q4_tau": [float(x) for x in q4_tau_values],
+            "q4_margin": [float(x) for x in q4_margin_values],
+            "h01_q": [float(x) for x in h01_q_values],
+            "h01_margin": [float(x) for x in h01_margin_values],
+        },
+        "best_balanced": None,
+        "best_robustness": None,
+        "best_imperceptibility": None,
+    }
+    if not ranking_df.empty:
+        best_payload["best_balanced"] = ranking_df.iloc[0].to_dict()
+        best_payload["best_robustness"] = ranking_df.sort_values(["rank_robustness", "rank_balanced", "sweep_index"]).iloc[0].to_dict()
+        best_payload["best_imperceptibility"] = ranking_df.sort_values(["rank_imperceptibility", "rank_balanced", "sweep_index"]).iloc[0].to_dict()
+    with open(paths["best"], "w", encoding="utf-8") as f:
+        json.dump(best_payload, f, indent=2, ensure_ascii=False, default=_json_default)
+
+    print(f"Saved proposal hparam sweep results to: {paths['results']}")
+    print(f"Saved proposal hparam sweep combo summary to: {paths['combo_summary']}")
+    print(f"Saved proposal hparam sweep ranking to: {paths['ranking']}")
+    if not ranking_df.empty:
+        show_cols = [
+            "sweep_combo_id",
+            "q4_tau_effective",
+            "q4_margin_effective",
+            "h01_q_effective",
+            "h01_margin_effective",
+            "clean_psnr_mean",
+            "mean_attack_nc",
+            "mean_attack_ber",
+            "balanced_score",
+            "rank_balanced",
+        ]
+        print(ranking_df[[c for c in show_cols if c in ranking_df.columns]].head(10).to_string(index=False))
+    if failures:
+        print(f"Hparam sweep failures: {len(failures)}. See proposal_hparam_sweep_failures.json")
+
+    return {
+        "results": results_df,
+        "raw_summary": raw_summary_df,
+        "summary": summary_df,
+        "summary_by_combo": combo_summary_df,
+        "ranking": ranking_df,
+        "comparison": comparison_df,
+        "manifest": manifest_df,
+        "failures": failures,
+        "best": best_payload,
+    }
+
+
+def _parse_proposal_ablation_variants(raw: str | list[str] | None) -> list[str]:
+    if raw is None:
+        return list(PROPOSAL_ABLATION_VARIANTS.keys())
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+    else:
+        parts = [str(p).strip() for p in raw if str(p).strip()]
+    if not parts or parts == ["all"]:
+        return list(PROPOSAL_ABLATION_VARIANTS.keys())
+    unknown = [p for p in parts if p not in PROPOSAL_ABLATION_VARIANTS]
+    if unknown:
+        valid = ", ".join(PROPOSAL_ABLATION_VARIANTS.keys())
+        raise ValueError(f"Unknown proposal ablation variant(s): {unknown}. Valid variants: {valid}, all")
+    return parts
+
+
+def run_proposal_ablation_phase(
+    host_dir: str | Path,
+    watermark_path: str | Path,
+    output_dir: str | Path,
+    *,
+    variants: str | list[str] | None = None,
+    max_images: int | None = None,
+    save_outputs: bool = False,
+    invert_watermark: bool = False,
+    attack_preset: str = "lite",
+    repeat: int | None = None,
+    optimized_payload: dict[str, Any] | None = None,
+    use_optimizer: bool = False,
+    optimizer_trials: int = 4,
+) -> dict[str, Any]:
+    """Run proposal-only ablations and write combined analysis tables.
+
+    Each ablation variant is executed as a separate proposal run so the normal
+    benchmark output for each variant is preserved under ``output_dir/<variant>``.
+    Combined CSVs are written directly in ``output_dir``.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    variant_names = _parse_proposal_ablation_variants(variants)
+
+    all_results: list[pd.DataFrame] = []
+    all_summaries: list[pd.DataFrame] = []
+    all_comparisons: list[pd.DataFrame] = []
+    failures: list[dict[str, Any]] = []
+    manifest_rows: list[dict[str, Any]] = []
+
+    for variant_name in variant_names:
+        spec = PROPOSAL_ABLATION_VARIANTS[variant_name]
+        params = {"repeat": repeat, "dwt_mode": "pywt", "ablation_name": variant_name}
+        params.update(dict(spec.get("params", {})))
+        # Explicit variant params should win over the global repeat setting.
+        if "repeat" in spec.get("params", {}):
+            params["repeat"] = spec["params"]["repeat"]
+
+        variant_output = output_dir / variant_name
+        print(f"[ABLATION] Running {variant_name}: {spec['description']}")
+        result = run_benchmark(
+            host_dir=host_dir,
+            watermark_path=watermark_path,
+            output_dir=variant_output,
+            selected_methods=["proposal"],
+            max_images=max_images,
+            save_outputs=save_outputs,
+            invert_watermark=invert_watermark,
+            attack_preset=attack_preset,
+            proposal_options={
+                "use_optimizer": bool(use_optimizer),
+                "optimizer_trials": int(optimizer_trials),
+                "params": params,
+                "optimized_payload": optimized_payload,
+            },
+            baseline_modes={},
+            guo_options={},
+            gaata_options={},
+        )
+
+        for key in ["results", "summary", "comparison"]:
+            df = result.get(key)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                df = df.copy()
+                if "proposal_ablation" not in df.columns:
+                    df["proposal_ablation"] = variant_name
+                df["ablation_description"] = str(spec["description"])
+                if key == "results":
+                    all_results.append(df)
+                elif key == "summary":
+                    all_summaries.append(df)
+                else:
+                    all_comparisons.append(df)
+
+        for rec in result.get("failures", []):
+            rec2 = dict(rec)
+            rec2["proposal_ablation"] = variant_name
+            failures.append(rec2)
+
+        manifest_rows.append({
+            "proposal_ablation": variant_name,
+            "description": str(spec["description"]),
+            "params": json.dumps(params, ensure_ascii=False, default=_json_default),
+            "output_dir": str(variant_output),
+        })
+
+    manifest = pd.DataFrame(manifest_rows)
+    manifest.to_csv(output_dir / "proposal_ablation_manifest.csv", index=False)
+
+    results_df = pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()
+    summary_df = pd.DataFrame()
+    attack_summary_df = pd.DataFrame()
+    delta_df = pd.DataFrame()
+
+    if not results_df.empty:
+        results_path = output_dir / "proposal_ablation_per_image_attack_results.csv"
+        results_df.to_csv(results_path, index=False)
+
+        agg_kwargs = dict(
+            psnr_mean=("psnr", "mean"),
+            ssim_mean=("ssim", "mean"),
+            nc_mean=("nc", "mean"),
+            ncc_mean=("ncc", "mean"),
+            ber_mean=("ber", "mean"),
+            psnr_std=("psnr", "std"),
+            nc_min=("nc", "min"),
+            ber_max=("ber", "max"),
+            images=("image", "nunique"),
+            rows=("image", "count"),
+            embed_time_mean_sec=("embed_time_sec", "mean"),
+            extract_time_mean_sec=("extract_time_sec", "mean"),
+        )
+        for optional in ["proposal_q4_used", "proposal_h_used", "proposal_skip_used", "proposal_repeat_factor", "proposal_usable_blocks"]:
+            if optional in results_df.columns:
+                agg_kwargs[f"{optional}_mean"] = (optional, "mean")
+
+        summary_df = (
+            results_df
+            .groupby(["proposal_ablation", "phase"], dropna=False)
+            .agg(**agg_kwargs)
+            .reset_index()
+        )
+        summary_df.to_csv(output_dir / "proposal_ablation_summary_by_variant_phase.csv", index=False)
+
+        after_df = results_df[results_df["phase"] == "after_attack"].copy()
+        if not after_df.empty:
+            attack_summary_df = (
+                after_df
+                .groupby(["proposal_ablation", "attack"], dropna=False)
+                .agg(**agg_kwargs)
+                .reset_index()
+            )
+            attack_summary_df.to_csv(output_dir / "proposal_ablation_summary_by_variant_attack.csv", index=False)
+            attack_group_lookup = {a.name: (manuscript43_family(a.name) if attack_preset in ("manuscript43", "manuscript_43", "paper43", "common43") else reviewer45_family(a.name) if attack_preset in ("reviewer45", "extended45") else str(a.group)) for a in default_attack_suite(include_none=False,preset=attack_preset)}
+            after_df["attack_group"] = after_df["attack"].map(attack_group_lookup).fillna("unknown")
+            attack_group_df = (after_df.groupby(["proposal_ablation","attack_group"],dropna=False)
+                              .agg(**agg_kwargs).reset_index())
+            attack_group_df.to_csv(output_dir / "proposal_ablation_summary_by_variant_attack_group.csv",index=False)
+
+        full_rows = summary_df[summary_df["proposal_ablation"] == "full"]
+        deltas: list[dict[str, Any]] = []
+        for _, row in summary_df.iterrows():
+            phase = row["phase"]
+            base = full_rows[full_rows["phase"] == phase]
+            if base.empty:
+                continue
+            base_row = base.iloc[0]
+            rec = {"proposal_ablation": row["proposal_ablation"], "phase": phase}
+            for metric in ["psnr_mean", "ssim_mean", "nc_mean", "ncc_mean", "ber_mean", "nc_min", "ber_max"]:
+                if metric in row and metric in base_row:
+                    rec[f"delta_{metric}_vs_full"] = float(row[metric]) - float(base_row[metric])
+            deltas.append(rec)
+        if deltas:
+            delta_df = pd.DataFrame(deltas)
+            delta_df.to_csv(output_dir / "proposal_ablation_delta_vs_full.csv", index=False)
+
+        print(f"Saved combined ablation results to: {results_path}")
+        print(f"Saved ablation phase summary to: {output_dir / 'proposal_ablation_summary_by_variant_phase.csv'}")
+        if not attack_summary_df.empty:
+            print(f"Saved ablation attack summary to: {output_dir / 'proposal_ablation_summary_by_variant_attack.csv'}")
+        if not delta_df.empty:
+            print(f"Saved full-vs-ablation deltas to: {output_dir / 'proposal_ablation_delta_vs_full.csv'}")
+        print(summary_df.to_string(index=False))
+
+    with open(output_dir / "proposal_ablation_failures.json", "w", encoding="utf-8") as f:
+        json.dump(failures, f, indent=2, ensure_ascii=False, default=_json_default)
+
+    return {
+        "results": results_df,
+        "summary": summary_df,
+        "attack_summary": attack_summary_df,
+        "delta_vs_full": delta_df,
+        "manifest": manifest,
+        "failures": failures,
+    }
 
 
 
@@ -635,17 +1467,832 @@ def run_guo_optimization_phase(
     return payload
 
 
+
+def run_gaata_optimization_phase(
+    host_dir: str | Path,
+    watermark_path: str | Path,
+    output_file: str | Path,
+    *,
+    max_images: int | None = None,
+    invert_watermark: bool = False,
+    mode: str = "adapt",
+    decimal_position: int = 3,
+    key_strength: float = 0.020,
+    embedding_rule: str | None = None,
+    qim_step: float = 16.0,
+    population_size: int = 8,
+    iterations: int = 3,
+    sparks_per_firework: int = 3,
+    seed: int = 2022,
+) -> dict[str, Any]:
+    """Run Gaata et al. 2022 FWA-style search for chaotic key parameters."""
+    host_dir = Path(host_dir)
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    host_paths = list_image_files(host_dir)
+    if max_images is not None:
+        host_paths = host_paths[: int(max_images)]
+    if not host_paths:
+        raise ValueError(f"No host images found in {host_dir}")
+
+    watermark = load_watermark_binary(watermark_path, invert=invert_watermark)
+    wm_bits = (np.asarray(watermark) >= 127).astype(np.uint8)
+
+    # Build the same base configuration as the selected local mode, then force the
+    # paper decimal digit in adapt mode. This separates expensive FWA from the
+    # normal benchmark run.
+    base_method = Gaata2022DWTHessFWA(
+        mode=mode,
+        decimal_position=decimal_position,
+        key_strength=key_strength,
+        embedding_rule=embedding_rule,
+        qim_step=qim_step,
+    )
+    base_config = base_method.config
+
+    per_image: dict[str, Any] = {}
+    rows: list[dict[str, Any]] = []
+    global_best: dict[str, Any] | None = None
+    global_best_mse = float("inf")
+
+    for idx, host_path in enumerate(host_paths):
+        host = load_host_rgb(host_path)
+        result = optimize_key_params(
+            host,
+            wm_bits,
+            base_config,
+            population_size=population_size,
+            iterations=iterations,
+            sparks_per_firework=sparks_per_firework,
+            seed=seed + idx * 100000,
+        )
+        entry = {
+            "image": host_path.stem,
+            "filename": host_path.name,
+            "key_params": [float(v) for v in result.best_params],
+            "best_mse": float(result.best_mse),
+            "best_psnr": float(result.best_psnr),
+            "decimal_position": int(base_config.decimal_position),
+            "key_strength": float(base_config.key_strength),
+            "history": result.history,
+        }
+        per_image[host_path.stem] = entry
+        per_image[host_path.name] = entry
+        if result.best_mse < global_best_mse:
+            global_best_mse = float(result.best_mse)
+            global_best = dict(entry)
+        rows.append({
+            "image": host_path.stem,
+            "filename": host_path.name,
+            "key_params": json.dumps([float(v) for v in result.best_params]),
+            "best_mse": float(result.best_mse),
+            "best_psnr": float(result.best_psnr),
+            "decimal_position": int(base_config.decimal_position),
+            "key_strength": float(base_config.key_strength),
+        })
+        print(f"[GAATA-OPT] {host_path.name}: psnr={result.best_psnr:.6f}, mse={result.best_mse:.6f}, key_params={entry['key_params']}")
+
+    payload = {
+        "format": GAATA_PARAM_FORMAT,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "host_dir": str(host_dir),
+        "watermark_path": str(watermark_path),
+        "mode": str(mode),
+        "param_names": ["x0", "y0", "r", "b"],
+        "embedding_rule": str(getattr(base_config, "embedding_rule", "decimal")),
+        "qim_step": float(getattr(base_config, "qim_step", 16.0)),
+        "global_best": global_best,
+        "per_image": per_image,
+    }
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False, default=_json_default)
+
+    csv_path = output_file.with_suffix(".csv")
+    if rows:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    print(f"Saved optimized Gaata key parameters to: {output_file}")
+    print(f"Saved optimized Gaata key parameter CSV to: {csv_path}")
+    return payload
+
+
+
+def _parse_csv_values(raw: str | None, cast=float) -> list[Any]:
+    if raw is None:
+        return []
+    parts = [p.strip() for p in str(raw).split(",") if str(p).strip()]
+    return [cast(p) for p in parts]
+
+
+def _proposal_plot_default_hosts() -> list[str]:
+    return ["airplane.bmp", "Girl.bmp", "house.bmp", "milkdrop.bmp", "safari.bmp", "tiffany.bmp"]
+
+
+def _resolve_proposal_plot_hosts(host_dir: str | Path, requested: list[str] | None) -> list[tuple[str, Path]]:
+    host_dir = Path(host_dir)
+    available = list_image_files(host_dir)
+    index: dict[str, Path] = {}
+    for p in available:
+        index[p.name.lower()] = p
+        index[p.stem.lower()] = p
+
+    alias = {
+        "girl": "lenna.bmp",
+        "girl.bmp": "lenna.bmp",
+        "lenna": "lenna.bmp",
+        "lenna.bmp": "lenna.bmp",
+        "airplane": "airplane.bmp",
+        "house": "house.bmp",
+        "milkdrop": "milkdrop.bmp",
+        "safari": "safari.bmp",
+        "tiffany": "tiffany.bmp",
+    }
+
+    wanted = requested or _proposal_plot_default_hosts()
+    resolved: list[tuple[str, Path]] = []
+    for item in wanted:
+        display = str(item).strip()
+        key = display.lower()
+        # Prefer an exact match from the dataset first. Only fall back to aliases
+        # such as Girl.bmp -> lenna.bmp when the exact filename is absent.
+        p = index.get(key) or index.get(Path(key).stem.lower())
+        if p is None:
+            target = alias.get(key, key)
+            p = index.get(target) or index.get(Path(target).stem.lower())
+        if p is None:
+            raise FileNotFoundError(f"Could not resolve proposal-plot host '{display}' inside {host_dir}")
+        resolved.append((display, p))
+    return resolved
+
+
+def _resolve_proposal_plot_watermarks(default_watermark: str | Path, raw_value: str | None) -> list[Path]:
+    if raw_value is None or not str(raw_value).strip():
+        return [Path(default_watermark)]
+    out: list[Path] = []
+    for item in [p.strip() for p in str(raw_value).split(",") if p.strip()]:
+        p = Path(item)
+        if p.is_dir():
+            for child in sorted(list_image_files(p)):
+                out.append(child)
+        else:
+            out.append(p)
+    return out
+
+
+def run_proposal_plot_phase(
+    *,
+    host_dir: str | Path,
+    watermark_path: str | Path,
+    output_dir: str | Path,
+    invert_watermark: bool,
+    host_names: list[str] | None,
+    watermark_paths: list[Path],
+    proposal_options: dict[str, Any] | None,
+    y_min: float = 0.70,
+    y_max: float = 1.00,
+    dpi: int = 180,
+    jpeg_values: list[int] | None = None,
+    salt_pepper_values: list[float] | None = None,
+    median_sizes: list[int] | None = None,
+    resize_values: list[float] | None = None,
+    jpeg2000_values: list[float] | None = None,
+    rotate_values: list[float] | None = None,
+    plot_layout: str = "single",
+):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    resolved_hosts = _resolve_proposal_plot_hosts(host_dir, host_names)
+    base_params = ProposalParams.from_dict((proposal_options or {}).get("params") or {"repeat": None, "dwt_mode": "pywt"})
+    optimized_payload = (proposal_options or {}).get("optimized_payload")
+    optimizer_trials = int((proposal_options or {}).get("optimizer_trials", 4))
+
+    jpeg_values = [int(v) for v in (jpeg_values or [90, 80, 70, 60, 50, 40, 30])]
+    salt_pepper_values = [float(v) for v in (salt_pepper_values or [0.01, 0.02, 0.03, 0.04, 0.05, 0.10, 0.15, 0.20])]
+    median_sizes = [int(v) for v in (median_sizes or [3, 5, 7, 9])]
+    resize_values = [float(v) for v in (resize_values or [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0])]
+    jpeg2000_values = [float(v) for v in (jpeg2000_values or [3, 5, 7, 10, 13, 15])]
+    rotate_values = [float(v) for v in (rotate_values or [5, 10, 15, 30, 45])]
+
+    attack_families = [
+        {
+            "key": "jpeg",
+            "title": "JPEG: NC vs Quality factor",
+            "xlabel": "Quality factor",
+            "group": "jpeg",
+            "values": jpeg_values,
+            "param_name": "quality",
+            "name_fmt": lambda v: f"plot_jpeg_q{int(v)}",
+        },
+        {
+            "key": "salt_pepper",
+            "title": "Salt & Pepper: NC vs Density",
+            "xlabel": "Density",
+            "group": "salt_pepper",
+            "values": salt_pepper_values,
+            "param_name": "amount",
+            "extra_params": {"seed": 123},
+            "name_fmt": lambda v: f"plot_salt_pepper_{str(v).replace('.', 'p')}",
+        },
+        {
+            "key": "median_filter",
+            "title": "Median Filter: NC vs Kernel size",
+            "xlabel": "Kernel size",
+            "group": "median_filter",
+            "values": median_sizes,
+            "param_name": "size",
+            "name_fmt": lambda v: f"plot_median_{int(v)}x{int(v)}",
+        },
+        {
+            "key": "resize",
+            "title": "Resize: NC vs Scale factor",
+            "xlabel": "Scale factor",
+            "group": "resize",
+            "values": resize_values,
+            "param_name": "factor",
+            "name_fmt": lambda v: f"plot_resize_{str(v).replace('.', 'p')}",
+        },
+        {
+            "key": "jpeg2000",
+            "title": "JPEG2000: NC vs Quality layer",
+            "xlabel": "Quality layer",
+            "group": "jpeg2000",
+            "values": jpeg2000_values,
+            "param_name": "quality_layer",
+            "name_fmt": lambda v: f"plot_jpeg2000_{str(v).replace('.', 'p')}",
+        },
+        {
+            "key": "rotation",
+            "title": "Rotation: NC vs Angle (deg)",
+            "xlabel": "Angle (deg)",
+            "group": "rotation",
+            "values": rotate_values,
+            "param_name": "degrees",
+            "name_fmt": lambda v: f"plot_rotate_{str(v).replace('.', 'p')}deg",
+        },
+    ]
+
+    rows: list[dict[str, Any]] = []
+    summary_rows: list[dict[str, Any]] = []
+
+    for wm_path in watermark_paths:
+        wm_path = Path(wm_path)
+        if not wm_path.exists():
+            raise FileNotFoundError(f"Proposal-plot watermark file not found: {wm_path}")
+        wm = load_watermark_binary(wm_path, invert=invert_watermark)
+        wm_label = wm_path.stem
+
+        for display_name, host_path in resolved_hosts:
+            host_rgb = load_host_rgb(host_path)
+            params, param_source = _select_proposal_params_for_image(host_path, base_params, optimized_payload)
+            method = ProposalQHDWTHess(params=params, use_optimizer=False, optimizer_trials=optimizer_trials)
+            watermarked, key = method.embed(host_rgb, wm)
+            clean_psnr = float(psnr(host_rgb, watermarked))
+            clean_ssim = float(ssim(host_rgb, watermarked))
+            clean_ext = method.extract(watermarked, key, host_rgb=host_rgb)
+            clean_nc = float(nc(wm, clean_ext))
+            clean_ber = float(ber(wm, clean_ext))
+            summary_rows.append({
+                "watermark_file": str(wm_path),
+                "watermark_name": wm_label,
+                "host_image": host_path.name,
+                "host_display_name": display_name,
+                "proposal_param_source": param_source,
+                "clean_psnr": clean_psnr,
+                "clean_ssim": clean_ssim,
+                "clean_nc": clean_nc,
+                "clean_ber": clean_ber,
+            })
+
+            for family in attack_families:
+                for order_idx, value in enumerate(family["values"]):
+                    params_dict = {family["param_name"]: value}
+                    params_dict.update(dict(family.get("extra_params", {})))
+                    attack = AttackConfig(family["name_fmt"](value), family["group"], params_dict)
+                    attacked = apply_attack(watermarked, attack)
+                    extracted = method.extract(attacked, key, host_rgb=host_rgb)
+                    rows.append({
+                        "watermark_file": str(wm_path),
+                        "watermark_name": wm_label,
+                        "host_image": host_path.name,
+                        "host_display_name": display_name,
+                        "proposal_param_source": param_source,
+                        "attack_family": family["key"],
+                        "attack_name": attack.name,
+                        "attack_group": family["group"],
+                        "x_value": float(value),
+                        "x_label": str(value),
+                        "x_order": int(order_idx),
+                        "nc": float(nc(wm, extracted)),
+                        "ber": float(ber(wm, extracted)),
+                    })
+
+        detail_df = pd.DataFrame(rows)
+        detail_path = output_dir / f"proposal_plot_detail_{wm_label}.csv"
+        detail_df[detail_df["watermark_name"] == wm_label].to_csv(detail_path, index=False)
+
+        wm_df = detail_df[detail_df["watermark_name"] == wm_label].copy()
+        host_order = [name for name, _ in resolved_hosts]
+
+        if str(plot_layout).lower() == "grid":
+            fig, axes = plt.subplots(3, 2, figsize=(12, 14))
+            axes_list = list(axes.flatten())
+            for ax, family in zip(axes_list, attack_families):
+                sub = wm_df[wm_df["attack_family"] == family["key"]].copy()
+                for host_name in host_order:
+                    host_sub = sub[sub["host_display_name"] == host_name].sort_values(["x_order", "x_value"])
+                    if host_sub.empty:
+                        continue
+                    ax.plot(host_sub["x_value"].to_numpy(), host_sub["nc"].to_numpy(), marker="o", linewidth=1.5, markersize=4, label=host_name)
+                ax.set_title(family["title"])
+                ax.set_xlabel(family["xlabel"])
+                ax.set_ylabel("NC (after attack)")
+                ax.set_ylim(float(y_min), float(y_max))
+                ax.grid(True, alpha=0.45)
+                ax.legend(loc="lower left", fontsize=8)
+                values = [float(v) for v in family["values"]]
+                ax.set_xticks(values)
+
+            fig.suptitle(f"Proposal method: NC under parameterized attacks ({wm_path.name})", fontsize=14)
+            fig.tight_layout(rect=[0, 0.03, 1, 0.98])
+            fig_path_png = output_dir / f"proposal_attack_sensitivity_{wm_label}.png"
+            fig_path_pdf = output_dir / f"proposal_attack_sensitivity_{wm_label}.pdf"
+            fig.savefig(fig_path_png, dpi=int(dpi), bbox_inches="tight")
+            fig.savefig(fig_path_pdf, dpi=int(dpi), bbox_inches="tight")
+            plt.close(fig)
+            print(f"Saved proposal sensitivity figure to: {fig_path_png}")
+        else:
+            for family in attack_families:
+                fig, ax = plt.subplots(figsize=(7.2, 5.4))
+                sub = wm_df[wm_df["attack_family"] == family["key"]].copy()
+                for host_name in host_order:
+                    host_sub = sub[sub["host_display_name"] == host_name].sort_values(["x_order", "x_value"])
+                    if host_sub.empty:
+                        continue
+                    ax.plot(host_sub["x_value"].to_numpy(), host_sub["nc"].to_numpy(), marker="o", linewidth=1.5, markersize=4, label=host_name)
+                ax.set_title(family["title"])
+                ax.set_xlabel(family["xlabel"])
+                ax.set_ylabel("NC (after attack)")
+                ax.set_ylim(float(y_min), float(y_max))
+                ax.grid(True, alpha=0.45)
+                ax.legend(loc="lower left", fontsize=8)
+                values = [float(v) for v in family["values"]]
+                # Dense parameter grids can overcrowd the x-axis. Show all ticks
+                # for short grids; otherwise show a readable subset while still
+                # plotting every measured value.
+                if len(values) <= 10:
+                    ax.set_xticks(values)
+                else:
+                    tick_idx = np.linspace(0, len(values) - 1, 8, dtype=int)
+                    ax.set_xticks([values[i] for i in tick_idx])
+                fig.tight_layout()
+                fig_path_png = output_dir / f"proposal_attack_sensitivity_{wm_label}_{family['key']}.png"
+                fig_path_pdf = output_dir / f"proposal_attack_sensitivity_{wm_label}_{family['key']}.pdf"
+                fig.savefig(fig_path_png, dpi=int(dpi), bbox_inches="tight")
+                fig.savefig(fig_path_pdf, dpi=int(dpi), bbox_inches="tight")
+                plt.close(fig)
+                print(f"Saved proposal sensitivity figure to: {fig_path_png}")
+    if rows:
+        all_detail_path = output_dir / "proposal_plot_detail_all_watermarks.csv"
+        pd.DataFrame(rows).to_csv(all_detail_path, index=False)
+        print(f"Saved proposal sensitivity detail CSV to: {all_detail_path}")
+    if summary_rows:
+        summary_path = output_dir / "proposal_plot_clean_summary.csv"
+        pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
+        print(f"Saved proposal clean summary CSV to: {summary_path}")
+
+
+def _load_resized_rgb_image(path: str | Path, size: int) -> np.ndarray:
+    """Load an image and resize it in memory; never writes back to data/."""
+    from PIL import Image
+
+    path = Path(path)
+    img = Image.open(path)
+    if img.mode == "RGBA":
+        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        img = Image.alpha_composite(bg, img.convert("RGBA")).convert("RGB")
+    else:
+        img = img.convert("RGB")
+    img = img.resize((int(size), int(size)), Image.Resampling.BICUBIC)
+    return np.asarray(img, dtype=np.uint8)
+
+
+def _load_resized_binary_watermark(path: str | Path, size: int, *, threshold: int = 127, invert: bool = False) -> np.ndarray:
+    """Load a watermark and resize/binarize it in memory; never writes back to data/."""
+    from PIL import Image
+
+    path = Path(path)
+    img = Image.open(path)
+    if img.mode == "RGBA":
+        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        img = Image.alpha_composite(bg, img.convert("RGBA")).convert("RGB")
+    else:
+        img = img.convert("RGB")
+    img = img.resize((int(size), int(size)), Image.Resampling.NEAREST).convert("L")
+    arr = np.asarray(img, dtype=np.uint8)
+    out = np.where(arr >= int(threshold), 255, 0).astype(np.uint8)
+    if invert:
+        out = 255 - out
+    return out
+
+
+def _validate_size_sweep_values(host_sizes: list[int], watermark_sizes: list[int]) -> tuple[list[int], list[int]]:
+    host_sizes = sorted({int(x) for x in host_sizes if int(x) > 0})
+    watermark_sizes = sorted({int(x) for x in watermark_sizes if int(x) > 0})
+    if not host_sizes:
+        raise ValueError("At least one positive host size is required.")
+    if not watermark_sizes:
+        raise ValueError("At least one positive watermark size is required.")
+    for hs in host_sizes:
+        if hs < 16:
+            raise ValueError(f"Host size {hs} is too small for the proposal DWT/block pipeline.")
+    for ws in watermark_sizes:
+        if ws < 2 or ws % 2 != 0:
+            raise ValueError(f"Watermark size {ws} must be a positive even square size.")
+    return host_sizes, watermark_sizes
+
+
+def _plot_size_sweep_bar(summary_df: pd.DataFrame, value_col: str, title: str, ylabel: str, output_base: Path, *, dpi: int = 180) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if summary_df.empty or value_col not in summary_df.columns:
+        return
+    plot_df = summary_df.copy()
+    plot_df["size_label"] = plot_df.apply(lambda r: f"H{int(r['host_size'])}/W{int(r['watermark_size'])}", axis=1)
+    plot_df = plot_df.sort_values(["host_size", "watermark_size"])
+
+    fig, ax = plt.subplots(figsize=(max(8.0, 0.55 * len(plot_df)), 5.0))
+    ax.bar(plot_df["size_label"].tolist(), plot_df[value_col].astype(float).to_numpy())
+    ax.set_title(title)
+    ax.set_xlabel("Host/watermark size")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, axis="y", alpha=0.35)
+    ax.tick_params(axis="x", rotation=45)
+    fig.tight_layout()
+    fig.savefig(str(output_base.with_suffix(".png")), dpi=int(dpi))
+    fig.savefig(str(output_base.with_suffix(".pdf")))
+    plt.close(fig)
+
+
+def _plot_size_sweep_heatmap(summary_df: pd.DataFrame, value_col: str, title: str, output_base: Path, *, dpi: int = 180) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if summary_df.empty or value_col not in summary_df.columns:
+        return
+    host_sizes = sorted(int(x) for x in summary_df["host_size"].dropna().unique())
+    wm_sizes = sorted(int(x) for x in summary_df["watermark_size"].dropna().unique())
+    if not host_sizes or not wm_sizes:
+        return
+    mat = np.full((len(host_sizes), len(wm_sizes)), np.nan, dtype=np.float64)
+    for _, row in summary_df.iterrows():
+        hi = host_sizes.index(int(row["host_size"]))
+        wi = wm_sizes.index(int(row["watermark_size"]))
+        mat[hi, wi] = float(row[value_col])
+
+    fig, ax = plt.subplots(figsize=(max(6.0, 0.9 * len(wm_sizes)), max(4.0, 0.55 * len(host_sizes))))
+    im = ax.imshow(mat, aspect="auto")
+    ax.set_title(title)
+    ax.set_xlabel("Watermark size")
+    ax.set_ylabel("Host size")
+    ax.set_xticks(np.arange(len(wm_sizes)), labels=[str(x) for x in wm_sizes])
+    ax.set_yticks(np.arange(len(host_sizes)), labels=[str(x) for x in host_sizes])
+    for i in range(len(host_sizes)):
+        for j in range(len(wm_sizes)):
+            if np.isfinite(mat[i, j]):
+                ax.text(j, i, f"{mat[i, j]:.3f}" if value_col.lower().startswith("mean_attack") else f"{mat[i, j]:.2f}", ha="center", va="center")
+    fig.colorbar(im, ax=ax)
+    fig.tight_layout()
+    fig.savefig(str(output_base.with_suffix(".png")), dpi=int(dpi))
+    fig.savefig(str(output_base.with_suffix(".pdf")))
+    plt.close(fig)
+
+
+def run_proposal_size_sweep_phase(
+    *,
+    host_dir: str | Path,
+    watermark_paths: list[str | Path],
+    output_dir: str | Path,
+    host_sizes: list[int],
+    watermark_sizes: list[int],
+    max_images: int | None = None,
+    save_outputs: bool = False,
+    invert_watermark: bool = False,
+    attack_preset: str = "lite",
+    proposal_options: dict[str, Any] | None = None,
+    dpi: int = 180,
+) -> dict[str, Any]:
+    """Run the proposal over multiple in-memory host/watermark sizes.
+
+    The data folder is never modified.  Host images and watermarks are resized
+    only as arrays used by this experiment, and optional visual outputs are saved
+    under ``output_dir``.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    host_sizes, watermark_sizes = _validate_size_sweep_values(host_sizes, watermark_sizes)
+
+    host_paths = list_image_files(host_dir)
+    if max_images is not None:
+        host_paths = host_paths[: int(max_images)]
+    if not host_paths:
+        raise ValueError(f"No host images found in {host_dir}")
+
+    wm_paths = [Path(p) for p in watermark_paths]
+    if not wm_paths:
+        raise ValueError("At least one watermark path is required.")
+    for wm_path in wm_paths:
+        if not wm_path.exists():
+            raise FileNotFoundError(f"Watermark file not found: {wm_path}")
+
+    base_params = ProposalParams.from_dict((proposal_options or {}).get("params") or {"repeat": None, "dwt_mode": "pywt"})
+    optimized_payload = (proposal_options or {}).get("optimized_payload")
+    use_optimizer = bool((proposal_options or {}).get("use_optimizer", False))
+    optimizer_trials = int((proposal_options or {}).get("optimizer_trials", 4))
+    attacks = default_attack_suite(include_none=False, preset=attack_preset)
+
+    clean_rows: list[dict[str, Any]] = []
+    attack_rows: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+
+    for host_path in host_paths:
+        params, param_source = _select_proposal_params_for_image(host_path, base_params, optimized_payload)
+        for host_size in host_sizes:
+            try:
+                host_rgb = _load_resized_rgb_image(host_path, host_size)
+            except Exception as e:
+                failures.append({"host_image": host_path.name, "host_size": int(host_size), "error": repr(e), "stage": "load_host"})
+                continue
+
+            for wm_path in wm_paths:
+                for watermark_size in watermark_sizes:
+                    context = {
+                        "host_image": host_path.name,
+                        "watermark_file": str(wm_path),
+                        "watermark_name": wm_path.stem,
+                        "host_size": int(host_size),
+                        "watermark_size": int(watermark_size),
+                        "proposal_param_source": param_source,
+                    }
+                    sweep_cache = AttackCheckpoint(
+                        output_dir / "progress" / host_path.stem /
+                        f"host_{host_size}_wm_{watermark_size}_{wm_path.stem}.json",
+                        fingerprint("size_sweep_v2", file_hash(__file__),
+                                    file_hash(host_path), file_hash(wm_path),
+                                    file_hash(Path(__file__).parent / "methods" / "proposal_qh_dwt_hess.py"),
+                                    params.to_dict(), host_size, watermark_size,
+                                    attack_preset, invert_watermark, use_optimizer,
+                                    optimizer_trials, [(a.name, a.params) for a in attacks]),
+                        numeric_columns=("embed_time_sec", "extract_time_sec"),
+                    )
+                    try:
+                        watermark = _load_resized_binary_watermark(wm_path, watermark_size, invert=invert_watermark)
+                        method = ProposalQHDWTHess(params=ProposalParams.from_dict(params.to_dict()), use_optimizer=use_optimizer, optimizer_trials=optimizer_trials)
+                        t0 = time.perf_counter()
+                        watermarked, key = method.embed(host_rgb, watermark)
+                        embed_time = time.perf_counter() - t0
+                        t1 = time.perf_counter()
+                        extracted_clean = method.extract(watermarked, key, host_rgb=host_rgb)
+                        extract_clean_time = time.perf_counter() - t1
+
+                        q4_used = int(sum(1 for x in getattr(key, "flags", []) if int(x) == 0))
+                        h_used = int(sum(1 for x in getattr(key, "flags", []) if int(x) == 1))
+                        skip_used = int(sum(1 for x in getattr(key, "flags", []) if int(x) == 2))
+                        clean_row = {
+                            **context,
+                            "phase": "before_attack",
+                            "attack": "no_attack",
+                            "clean_psnr": float(psnr(host_rgb, watermarked)),
+                            "clean_ssim": float(ssim(host_rgb, watermarked)),
+                            "clean_nc": float(nc(watermark, extracted_clean)),
+                            "clean_ncc": float(ncc(watermark, extracted_clean)),
+                            "clean_ber": float(ber(watermark, extracted_clean)),
+                            "embed_time_sec": float(embed_time),
+                            "extract_time_sec": float(extract_clean_time),
+                            "proposal_repeat_factor": int(getattr(key, "repeat_factor", 0)),
+                            "proposal_usable_blocks": int(getattr(key, "usable_blocks", 0)),
+                            "proposal_total_blocks": int(getattr(key, "total_blocks", 0)),
+                            "proposal_q4_used": q4_used,
+                            "proposal_h_used": h_used,
+                            "proposal_skip_used": skip_used,
+                        }
+                        sweep_cache.prepare(watermarked)
+                        prior_clean = sweep_cache.clean()
+                        if prior_clean is not None:
+                            clean_row = prior_clean
+                        else:
+                            sweep_cache.set_clean(clean_row)
+                        clean_rows.append(clean_row)
+
+                        if save_outputs:
+                            base = output_dir / "images" / f"host_{host_size}" / f"wm_{watermark_size}" / host_path.stem / wm_path.stem
+                            save_image(base / "host_resized.png", host_rgb)
+                            save_image(base / "watermark_resized.png", watermark)
+                            save_image(base / "host_before_attack_watermarked.png", watermarked)
+                            save_image(base / "watermark_extracted_before_attack.png", extracted_clean)
+
+                        for attack in attacks:
+                            cached_row = sweep_cache.attack(attack.name)
+                            if cached_row is not None:
+                                attack_rows.append(cached_row)
+                                continue
+                            try:
+                                attacked = apply_attack(watermarked, attack)
+                                t2 = time.perf_counter()
+                                extracted = method.extract(attacked, key, host_rgb=host_rgb)
+                                extract_time = time.perf_counter() - t2
+                                attack_row = {
+                                    **context,
+                                    "phase": "after_attack",
+                                    "attack": attack.name,
+                                    "attack_group": attack.group,
+                                    "attack_params": json.dumps(attack.params, ensure_ascii=False, default=_json_default),
+                                    "psnr_after_attack": float(psnr(host_rgb, attacked)),
+                                    "ssim_after_attack": float(ssim(host_rgb, attacked)),
+                                    "nc_after_attack": float(nc(watermark, extracted)),
+                                    "ncc_after_attack": float(ncc(watermark, extracted)),
+                                    "ber_after_attack": float(ber(watermark, extracted)),
+                                    "embed_time_sec": float(embed_time),
+                                    "extract_time_sec": float(extract_time),
+                                    "proposal_repeat_factor": int(getattr(key, "repeat_factor", 0)),
+                                    "proposal_usable_blocks": int(getattr(key, "usable_blocks", 0)),
+                                    "proposal_total_blocks": int(getattr(key, "total_blocks", 0)),
+                                    "proposal_q4_used": q4_used,
+                                    "proposal_h_used": h_used,
+                                    "proposal_skip_used": skip_used,
+                                }
+                                attack_rows.append(attack_row)
+                                sweep_cache.set_attack(attack.name, attack_row)
+                                if save_outputs:
+                                    attack_base = base / "attacks" / attack.name
+                                    save_image(attack_base / "host_after_attack.png", attacked)
+                                    save_image(attack_base / "watermark_extracted_after_attack.png", extracted)
+                            except Exception as e:
+                                failures.append({**context, "attack": attack.name, "error": repr(e), "stage": "attack_extract"})
+                    except Exception as e:
+                        failures.append({**context, "attack": "embedding_or_clean_extraction", "error": repr(e), "stage": "embed_extract"})
+
+    clean_df = pd.DataFrame(clean_rows)
+    attack_df = pd.DataFrame(attack_rows)
+    clean_path = output_dir / "proposal_size_sweep_clean_results.csv"
+    attack_path = output_dir / "proposal_size_sweep_attack_results.csv"
+    clean_df.to_csv(clean_path, index=False)
+    attack_df.to_csv(attack_path, index=False)
+
+    if not clean_df.empty:
+        clean_summary = (
+            clean_df.groupby(["host_size", "watermark_size"], dropna=False)
+            .agg(
+                clean_psnr_mean=("clean_psnr", "mean"),
+                clean_psnr_std=("clean_psnr", "std"),
+                clean_ssim_mean=("clean_ssim", "mean"),
+                clean_nc_mean=("clean_nc", "mean"),
+                clean_ber_mean=("clean_ber", "mean"),
+                repeat_factor_mean=("proposal_repeat_factor", "mean"),
+                usable_blocks_mean=("proposal_usable_blocks", "mean"),
+                host_images=("host_image", "nunique"),
+                watermarks=("watermark_file", "nunique"),
+                rows=("host_image", "count"),
+            )
+            .reset_index()
+        )
+    else:
+        clean_summary = pd.DataFrame()
+    clean_summary_path = output_dir / "proposal_size_sweep_clean_summary.csv"
+    clean_summary.to_csv(clean_summary_path, index=False)
+
+    if not attack_df.empty:
+        attack_summary = (
+            attack_df.groupby(["host_size", "watermark_size", "attack"], dropna=False)
+            .agg(
+                nc_after_attack_mean=("nc_after_attack", "mean"),
+                nc_after_attack_min=("nc_after_attack", "min"),
+                ber_after_attack_mean=("ber_after_attack", "mean"),
+                psnr_after_attack_mean=("psnr_after_attack", "mean"),
+                rows=("host_image", "count"),
+            )
+            .reset_index()
+        )
+        combo_attack_summary = (
+            attack_df.groupby(["host_size", "watermark_size"], dropna=False)
+            .agg(
+                mean_attack_nc=("nc_after_attack", "mean"),
+                min_attack_nc=("nc_after_attack", "min"),
+                mean_attack_ber=("ber_after_attack", "mean"),
+                mean_attack_psnr=("psnr_after_attack", "mean"),
+                attack_rows=("host_image", "count"),
+            )
+            .reset_index()
+        )
+    else:
+        attack_summary = pd.DataFrame()
+        combo_attack_summary = pd.DataFrame()
+    attack_summary_path = output_dir / "proposal_size_sweep_attack_summary_by_attack.csv"
+    combo_attack_summary_path = output_dir / "proposal_size_sweep_attack_summary_by_size.csv"
+    attack_summary.to_csv(attack_summary_path, index=False)
+    combo_attack_summary.to_csv(combo_attack_summary_path, index=False)
+
+    if not clean_summary.empty:
+        combo_summary = clean_summary.copy()
+        if not combo_attack_summary.empty:
+            combo_summary = combo_summary.merge(combo_attack_summary, on=["host_size", "watermark_size"], how="left")
+        else:
+            combo_summary["mean_attack_nc"] = np.nan
+            combo_summary["min_attack_nc"] = np.nan
+            combo_summary["mean_attack_ber"] = np.nan
+            combo_summary["mean_attack_psnr"] = np.nan
+            combo_summary["attack_rows"] = 0
+    else:
+        combo_summary = pd.DataFrame()
+    combo_summary_path = output_dir / "proposal_size_sweep_summary_by_size.csv"
+    combo_summary.to_csv(combo_summary_path, index=False)
+
+    with open(output_dir / "proposal_size_sweep_failures.json", "w", encoding="utf-8") as f:
+        json.dump(failures, f, indent=2, ensure_ascii=False, default=_json_default)
+
+    if not combo_summary.empty:
+        _plot_size_sweep_bar(
+            combo_summary,
+            "clean_psnr_mean",
+            "Proposal clean PSNR before attack by host/watermark size",
+            "PSNR before attack (dB)",
+            output_dir / "proposal_size_sweep_psnr_before_attack",
+            dpi=dpi,
+        )
+        _plot_size_sweep_heatmap(
+            combo_summary,
+            "clean_psnr_mean",
+            "Clean PSNR before attack",
+            output_dir / "proposal_size_sweep_psnr_before_attack_heatmap",
+            dpi=dpi,
+        )
+        if "mean_attack_nc" in combo_summary.columns and combo_summary["mean_attack_nc"].notna().any():
+            _plot_size_sweep_bar(
+                combo_summary,
+                "mean_attack_nc",
+                "Proposal mean NC after attack by host/watermark size",
+                "Mean NC after attack",
+                output_dir / "proposal_size_sweep_nc_after_attack",
+                dpi=dpi,
+            )
+            _plot_size_sweep_heatmap(
+                combo_summary,
+                "mean_attack_nc",
+                "Mean NC after attack",
+                output_dir / "proposal_size_sweep_nc_after_attack_heatmap",
+                dpi=dpi,
+            )
+
+    print(f"Saved proposal size-sweep clean CSV to: {clean_path}")
+    print(f"Saved proposal size-sweep attack CSV to: {attack_path}")
+    print(f"Saved proposal size-sweep summary to: {combo_summary_path}")
+    if not combo_summary.empty:
+        print(combo_summary.to_string(index=False))
+    expected_clean = len(host_paths) * len(host_sizes) * len(wm_paths) * len(watermark_sizes)
+    expected_attack = expected_clean * len(attacks)
+    if failures or len(clean_rows) != expected_clean or len(attack_rows) != expected_attack:
+        raise RuntimeError(
+            f"Incomplete size sweep: clean={len(clean_rows)}/{expected_clean}, "
+            f"attacks={len(attack_rows)}/{expected_attack}, failures={len(failures)}. "
+            "Partial attack progress is saved in output/progress."
+        )
+
+    return {
+        "clean_results": clean_df,
+        "attack_results": attack_df,
+        "clean_summary": clean_summary,
+        "attack_summary": attack_summary,
+        "summary_by_size": combo_summary,
+        "failures": failures,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run the cleaned watermarking benchmark on 512x512 RGB host images and a 64x64 binary watermark.")
-    parser.add_argument("--phase", default="normal", choices=["normal", "optimize", "optimization"], help="normal: run benchmark; optimize: search proposal parameters and export them.")
+    parser.add_argument("--phase", default="normal", choices=["normal", "optimize", "optimization", "proposal-plot", "proposal_plot", "plot-proposal", "proposal-ablation", "proposal_ablation", "ablation", "proposal-size-sweep", "proposal_size_sweep", "size-sweep", "proposal-hparam-sweep", "proposal_hparam_sweep", "hparam-sweep", "neural"], help="normal: run benchmark; optimize: search/export parameters; proposal-plot: generate NC-vs-attack plots; proposal-ablation: run proposal component ablations; proposal-size-sweep: run the proposal over multiple resized host/watermark sizes; proposal-hparam-sweep: grid sweep Tier-1 proposal hyperparameters q4_tau, q4_margin, h01_q, h01_margin.")
     parser.add_argument("--host-dir", default="data/host")
     parser.add_argument("--watermark", default="data/watermark/wm.png")
     parser.add_argument("--output", default="results/common_benchmark")
-    parser.add_argument("--methods", default="all", help="Comma-separated: all,baselines,kumar2021,guo2017_dwt_qr_fa,gaata2022_dwt_hess_fwa,dwt_hd_svd_2025,hess_nha2023,roy2018_dwt_svd,proposal")
+    parser.add_argument("--methods", default="all", help="Comma-separated: all,baselines,kumar2021,guo2017_dwt_qr_fa,gaata2022_dwt_hess_fwa,dwt_hd_svd_2025,hess_nha2023,roy2018_dwt_svd,dwt_wht_svd_2024,qwt_qsvd_zhang2022_blind,qwt_qsvd_zhang2022_semiblind,zhu2021_iwt_svd_adapted,abodena2022_lwt_dct_hess,su2016_contourlet_hess,proposal")
+    parser.add_argument("--neural-device", default="auto", choices=["auto", "cpu", "cuda"], help="Neural phase: device for WAM (TrustMark uses its upstream default).")
+    parser.add_argument("--neural-model-type", default="Q", choices=["B", "C", "P", "Q"], help="Neural phase: TrustMark model variant.")
+    parser.add_argument("--neural-max-attacks", type=int, default=0, help="Neural phase: attack count limit per host (0 = entire preset).")
+    parser.add_argument("--neural-seed", type=int, default=3101, help="Neural phase: deterministic payload seed.")
     parser.add_argument("--max-images", type=int, default=None, help="Optional quick-run limit.")
     parser.add_argument("--no-save-images", action="store_true")
     parser.add_argument("--invert-watermark", action="store_true")
-    parser.add_argument("--attack-preset", default="lite", choices=["none", "lite", "full", "stress", "script", "requested", "grid"], help="Attack preset for normal benchmark.")
+    parser.add_argument("--attack-preset", default="lite", choices=["none", "lite", "full", "reviewer_stress", "manuscript43", "reviewer45", "stress", "script", "requested", "grid"], help="Attack preset for normal benchmark.")
     parser.add_argument("--baseline-mode", default="adapt", choices=["adapt", "original", "original-rerun"], help="Global baseline mode: adapt runs local adapted benchmark; original writes paper-reported tables; original-rerun attempts a stricter local rerun.")
     parser.add_argument("--kumar-mode", default="inherit", choices=["inherit", "adapt", "original", "original-rerun"])
     parser.add_argument("--guo-mode", default="inherit", choices=["inherit", "adapt", "original", "original-rerun"])
@@ -653,12 +2300,17 @@ def main():
     parser.add_argument("--dwt-hd-svd-mode", default="inherit", choices=["inherit", "adapt", "original", "original-rerun"])
     parser.add_argument("--hess-nha-mode", default="inherit", choices=["inherit", "adapt", "paper", "original", "original-rerun"], help="Hess-Nha2023 mode: adapt uses T=15 for 64x64; paper/original-rerun uses T=65 with 64x64 tiling.")
     parser.add_argument("--roy-mode", default="inherit", choices=["inherit", "adapt", "original", "original-rerun"], help="Roy2018 mode: adapt/original-rerun run the local DWT-SVD baseline; original writes paper-reported rows.")
+    parser.add_argument("--dwt-wht-svd-mode", default="inherit", choices=["inherit", "adapt", "original", "original-rerun"], help="DWT-WHT-SVD2024 mode: adapt/original-rerun run the semi-blind local baseline; original writes paper-reported rows if available.")
+    parser.add_argument("--qwt-qsvd-mode", default="inherit", choices=["inherit", "adapt", "original", "original-rerun"], help="Zhang2022 QWT-QSVD mode for both blind and semi-blind variants.")
+    parser.add_argument("--abodena-mode", default="inherit", choices=["inherit", "adapt", "original", "original-rerun"], help="Abodena2022: adapt = one LWT level for 512x512; original-rerun requires 1024x1024.")
+    parser.add_argument("--su2016-mode", default="inherit", choices=["inherit", "adapt", "original", "original-rerun"], help="Su2016: 512x512 4096-bit adapted LP lowpass baseline.")
+    parser.add_argument("--zhu-iwt-svd-mode", default="inherit", choices=["inherit", "adapt", "original", "original-rerun"], help="Zhu2021 IWT-SVD mode. adapt uses the 64x64 YCbCr-Y benchmark adapter; original/original-rerun is for native 32x32 grayscale experiments.")
 
     parser.add_argument("--guo-param-file", default=DEFAULT_GUO_PARAM_FILE, help="JSON file written by Guo Firefly optimization phase. Normal phase loads it automatically when it exists.")
     parser.add_argument("--guo-param-mode", default="auto", choices=["auto", "ignore", "require"], help="auto: use Guo lambda file if present; ignore: fixed/default lambda; require: fail if missing.")
     parser.add_argument("--guo-optimizer-fireflies", type=int, default=10)
     parser.add_argument("--guo-optimizer-generations", type=int, default=10)
-    parser.add_argument("--guo-optimizer-attack-preset", default="full", choices=["none", "lite", "full", "stress", "script", "requested", "grid"], help="Attack preset used while optimizing Guo lambda.")
+    parser.add_argument("--guo-optimizer-attack-preset", default="full", choices=["none", "lite", "full", "reviewer_stress", "manuscript43", "reviewer45", "stress", "script", "requested", "grid"], help="Attack preset used while optimizing Guo lambda.")
     parser.add_argument("--guo-optimizer-alpha", type=float, default=0.01, help="FA randomization alpha, paper default 0.01.")
     parser.add_argument("--guo-optimizer-beta0", type=float, default=1.0, help="FA beta0, paper default 1.")
     parser.add_argument("--guo-optimizer-gamma", type=float, default=1.0, help="FA gamma, paper default 1.")
@@ -667,21 +2319,68 @@ def main():
     parser.add_argument("--guo-lambda-max", type=float, default=20.0)
     parser.add_argument("--guo-optimizer-seed", type=int, default=2017)
 
+    parser.add_argument("--gaata-param-file", default=DEFAULT_GAATA_PARAM_FILE, help="JSON file written by Gaata FWA key-parameter optimization phase. Normal phase loads it automatically when it exists.")
+    parser.add_argument("--gaata-param-mode", default="auto", choices=["auto", "ignore", "require"], help="auto: use Gaata key-parameter file if present; ignore: default keys; require: fail if missing.")
+    parser.add_argument("--gaata-optimizer-population", type=int, default=8)
+    parser.add_argument("--gaata-optimizer-iterations", type=int, default=3)
+    parser.add_argument("--gaata-optimizer-sparks", type=int, default=3)
+    parser.add_argument("--gaata-optimizer-seed", type=int, default=2022)
+    parser.add_argument("--gaata-key-strength", type=float, default=0.020)
+    parser.add_argument("--gaata-decimal-position", type=int, default=3, help="Paper decimal digit after the floating point; default 3.")
+    parser.add_argument("--gaata-embedding-rule", default="auto", choices=["auto", "decimal", "qim"], help="auto: qim for adapt mode, decimal for original-rerun; decimal: paper-style selected decimal digit; qim: uint8-safe adapted rule.")
+    parser.add_argument("--gaata-qim-step", type=float, default=16.0, help="Quantization step for Gaata's uint8-safe adapted QIM rule.")
+
+    parser.add_argument("--resume-attack-journal", action="store_true", help="Persist validated per-attack rows for interruption-safe held-out benchmarks.")
     parser.add_argument("--proposal-param-file", default=DEFAULT_PROPOSAL_PARAM_FILE, help="JSON/CSV file written by optimization phase. Normal phase loads it automatically when it exists.")
     parser.add_argument("--proposal-param-mode", default="auto", choices=["auto", "ignore", "require"], help="auto: use param file if present; ignore: always defaults; require: fail if missing.")
     parser.add_argument("--proposal-use-optimizer", action="store_true", help="Legacy one-pass adaptive mode. For reproducible two-phase use --phase optimize first, then --phase normal.")
     parser.add_argument("--proposal-optimizer-trials", type=int, default=4, help="Legacy alias for --proposal-optimizer-fireflies.")
     parser.add_argument("--proposal-optimizer-fireflies", type=int, default=None)
     parser.add_argument("--proposal-optimizer-generations", type=int, default=2)
-    parser.add_argument("--proposal-optimizer-attack-preset", default="lite", choices=["none", "lite", "full", "stress", "script", "requested", "grid"], help="Attack preset used while optimizing parameters.")
+    parser.add_argument("--proposal-optimizer-attack-preset", default="lite", choices=["none", "lite", "full", "reviewer_stress", "manuscript43", "reviewer45", "stress", "script", "requested", "grid"], help="Attack preset used while optimizing parameters.")
     parser.add_argument("--proposal-optimizer-alpha", type=float, default=0.18)
     parser.add_argument("--proposal-optimizer-beta0", type=float, default=1.0)
     parser.add_argument("--proposal-optimizer-gamma", type=float, default=1.0)
     parser.add_argument("--proposal-optimizer-alpha-decay", type=float, default=0.80)
     parser.add_argument("--proposal-optimizer-seed", type=int, default=123)
     parser.add_argument("--proposal-repeat", default="full", help="Default full/faithful uses all source-script structured repetition; use an integer such as 3 only for quick practical runs.")
+    parser.add_argument("--ablation-variants", default=DEFAULT_PROPOSAL_ABLATION_VARIANTS, help="Comma-separated proposal ablations to run, or all. Valid: " + ",".join(PROPOSAL_ABLATION_VARIANTS.keys()))
+    parser.add_argument("--plot-watermarks", default="", help="Optional comma-separated watermark files or folders for proposal-plot phase. Empty uses --watermark only.")
+    parser.add_argument("--proposal-plot-hosts", default="airplane.bmp,Girl.bmp,house.bmp,milkdrop.bmp,safari.bmp,tiffany.bmp", help="Comma-separated host-image names for proposal-plot phase.")
+    parser.add_argument("--proposal-plot-jpeg-values", default="100,95,90,85,80,75,70,65,60,55,50,45,40,35,30,25,20")
+    parser.add_argument("--proposal-plot-salt-pepper-values", default="0.005,0.01,0.015,0.02,0.025,0.03,0.035,0.04,0.045,0.05,0.075,0.10,0.125,0.15,0.175,0.20,0.25,0.30")
+    parser.add_argument("--proposal-plot-median-sizes", default="3,5,7,9,11,13,15")
+    parser.add_argument("--proposal-plot-resize-values", default="0.25,0.33,0.40,0.50,0.60,0.75,0.90,1.00,1.10,1.25,1.50,1.75,2.00,2.50,3.00,4.00")
+    parser.add_argument("--proposal-plot-jpeg2000-values", default="1,2,3,4,5,6,7,8,10,12,13,15,18,20,25,30")
+    parser.add_argument("--proposal-plot-rotate-values", default="1,2,3,5,7,10,12,15,20,25,30,35,40,45,60,75,90")
+    parser.add_argument("--proposal-plot-ymin", type=float, default=0.70)
+    parser.add_argument("--proposal-plot-ymax", type=float, default=1.00)
+    parser.add_argument("--proposal-plot-dpi", type=int, default=180)
+    parser.add_argument("--proposal-plot-layout", default="single", choices=["single", "grid"], help="single: save one figure per attack family; grid: save one 3x2 combined figure.")
+    parser.add_argument("--size-sweep-host-sizes", default="256,512,1024", help="Comma-separated square host sizes for proposal-size-sweep. Images are resized in memory only.")
+    parser.add_argument("--size-sweep-watermark-sizes", default="32,64,128", help="Comma-separated square watermark sizes for proposal-size-sweep. Watermarks are resized in memory only.")
+    parser.add_argument("--size-sweep-watermarks", default="", help="Optional comma-separated watermark files or folders for proposal-size-sweep. Empty uses --watermark.")
+    parser.add_argument("--size-sweep-dpi", type=int, default=180, help="DPI for proposal-size-sweep PNG plots.")
+    parser.add_argument("--hparam-sweep-q4-tau", default="0.35,0.40,0.45,0.50,0.55,0.60,0.65", help="Comma-separated q4_tau values for proposal-hparam-sweep.")
+    parser.add_argument("--hparam-sweep-q4-margin", default="0.04,0.06,0.08,0.10,0.12,0.14", help="Comma-separated q4_margin values for proposal-hparam-sweep.")
+    parser.add_argument("--hparam-sweep-h01-q", default="5,6,7,8,9,10", help="Comma-separated h01_q values for proposal-hparam-sweep.")
+    parser.add_argument("--hparam-sweep-h01-margin", default="0.50,0.70,0.90,1.10,1.20", help="Comma-separated h01_margin values for proposal-hparam-sweep. Effective values are clipped to <= 0.49*h01_q.")
+    parser.add_argument("--hparam-sweep-max-combinations", type=int, default=None, help="Optional debug limit for proposal-hparam-sweep; default runs the full grid.")
 
     args = parser.parse_args()
+    if args.phase == "neural":
+        # Keep ML/DL evaluation distinct: `--methods all` means both pretrained
+        # neural methods only in this phase, not the eleven classical methods.
+        from watermarklab.experiments.neural_baselines import run_dataset
+        run_dataset(
+            methods=args.methods, host_dir=args.host_dir, output=args.output,
+            attack_preset=args.attack_preset, max_images=args.max_images,
+            max_attacks=args.neural_max_attacks, seed=args.neural_seed,
+            device=args.neural_device, model_type=args.neural_model_type,
+            save_images=not args.no_save_images,
+        )
+        print(f"Saved neural comparison table to: {Path(args.output) / 'compare_psnr_nc_ber_ncc_before_after_attack.csv'}")
+        return
     fireflies = int(args.proposal_optimizer_fireflies if args.proposal_optimizer_fireflies is not None else args.proposal_optimizer_trials)
     repeat_value = _parse_repeat(args.proposal_repeat)
     selected = [s.strip() for s in args.methods.split(",") if s.strip()]
@@ -714,6 +2413,25 @@ def main():
             )
             return
 
+        if selected_normalized == ["gaata2022_dwt_hess_fwa"]:
+            run_gaata_optimization_phase(
+                host_dir=args.host_dir,
+                watermark_path=args.watermark,
+                output_file=args.gaata_param_file,
+                max_images=args.max_images,
+                invert_watermark=args.invert_watermark,
+                mode=args.baseline_mode if args.gaata_mode == "inherit" else args.gaata_mode,
+                decimal_position=int(args.gaata_decimal_position),
+                key_strength=float(args.gaata_key_strength),
+                embedding_rule=None if str(args.gaata_embedding_rule).lower() == "auto" else str(args.gaata_embedding_rule).lower(),
+                qim_step=float(args.gaata_qim_step),
+                population_size=int(args.gaata_optimizer_population),
+                iterations=int(args.gaata_optimizer_iterations),
+                sparks_per_firework=int(args.gaata_optimizer_sparks),
+                seed=int(args.gaata_optimizer_seed),
+            )
+            return
+
         run_proposal_optimization_phase(
             host_dir=args.host_dir,
             watermark_path=args.watermark,
@@ -738,16 +2456,29 @@ def main():
         return args.baseline_mode if value == "inherit" else value
 
     baseline_modes = {
+        "abodena2022_lwt_dct_hess": _mode(args.abodena_mode),
+        "su2016_contourlet_hess": _mode(args.su2016_mode),
         "kumar2021": _mode(args.kumar_mode),
         "guo2017_dwt_qr_fa": _mode(args.guo_mode),
         "gaata2022_dwt_hess_fwa": _mode(args.gaata_mode),
         "dwt_hd_svd_2025": _mode(args.dwt_hd_svd_mode),
         "hess_nha2023": _mode(args.hess_nha_mode),
         "roy2018_dwt_svd": _mode(args.roy_mode),
+        "dwt_wht_svd_2024": _mode(args.dwt_wht_svd_mode),
+        "qwt_qsvd_zhang2022_blind": _mode(args.qwt_qsvd_mode),
+        "qwt_qsvd_zhang2022_semiblind": _mode(args.qwt_qsvd_mode),
+        "zhu2021_iwt_svd_adapted": _mode(args.zhu_iwt_svd_mode),
+    }
+
+    proposal_only_phase = args.phase in {
+        "proposal-ablation", "proposal_ablation", "ablation",
+        "proposal-plot", "proposal_plot", "plot-proposal",
+        "proposal-size-sweep", "proposal_size_sweep", "size-sweep",
+        "proposal-hparam-sweep", "proposal_hparam_sweep", "hparam-sweep",
     }
 
     guo_optimized_payload = None
-    if args.guo_param_mode != "ignore":
+    if (not proposal_only_phase) and args.guo_param_mode != "ignore":
         guo_optimized_payload = load_guo_param_file(args.guo_param_file)
         if args.guo_param_mode == "require" and not guo_optimized_payload.get("loaded"):
             raise FileNotFoundError(f"Required Guo lambda file was not loaded: {args.guo_param_file}")
@@ -755,6 +2486,16 @@ def main():
             print(f"[NORMAL] Loaded optimized Guo lambda from: {args.guo_param_file}")
         else:
             print(f"[NORMAL] No optimized Guo lambda file found; using default Guo lambda. Checked: {args.guo_param_file}")
+
+    gaata_optimized_payload = None
+    if (not proposal_only_phase) and args.gaata_param_mode != "ignore":
+        gaata_optimized_payload = load_gaata_param_file(args.gaata_param_file)
+        if args.gaata_param_mode == "require" and not gaata_optimized_payload.get("loaded"):
+            raise FileNotFoundError(f"Required Gaata key-parameter file was not loaded: {args.gaata_param_file}")
+        if gaata_optimized_payload.get("loaded"):
+            print(f"[NORMAL] Loaded optimized Gaata key parameters from: {args.gaata_param_file}")
+        else:
+            print(f"[NORMAL] No optimized Gaata key-parameter file found; using default Gaata keys. Checked: {args.gaata_param_file}")
 
     optimized_payload = None
     if args.proposal_param_mode != "ignore":
@@ -776,6 +2517,91 @@ def main():
         "k_mode": "paper_integral",
         "optimized_payload": guo_optimized_payload,
     }
+    gaata_embedding_rule = None if str(args.gaata_embedding_rule).lower() == "auto" else str(args.gaata_embedding_rule).lower()
+    gaata_options = {
+        "decimal_position": int(args.gaata_decimal_position),
+        "key_strength": float(args.gaata_key_strength),
+        "embedding_rule": gaata_embedding_rule,
+        "qim_step": float(args.gaata_qim_step),
+        "optimized_payload": gaata_optimized_payload,
+    }
+
+    if args.phase in {"proposal-ablation", "proposal_ablation", "ablation"}:
+        run_proposal_ablation_phase(
+            host_dir=args.host_dir,
+            watermark_path=args.watermark,
+            output_dir=args.output,
+            variants=args.ablation_variants,
+            max_images=args.max_images,
+            save_outputs=not args.no_save_images,
+            invert_watermark=args.invert_watermark,
+            attack_preset=args.attack_preset,
+            repeat=repeat_value,
+            optimized_payload=optimized_payload,
+            use_optimizer=bool(args.proposal_use_optimizer),
+            optimizer_trials=fireflies,
+        )
+        return
+
+    if args.phase in {"proposal-size-sweep", "proposal_size_sweep", "size-sweep"}:
+        raw_wm = str(args.size_sweep_watermarks).strip()
+        size_sweep_watermarks = _resolve_proposal_plot_watermarks(args.watermark, raw_wm)
+        run_proposal_size_sweep_phase(
+            host_dir=args.host_dir,
+            watermark_paths=size_sweep_watermarks,
+            output_dir=args.output,
+            host_sizes=_parse_csv_values(args.size_sweep_host_sizes, int),
+            watermark_sizes=_parse_csv_values(args.size_sweep_watermark_sizes, int),
+            max_images=args.max_images,
+            save_outputs=not args.no_save_images,
+            invert_watermark=args.invert_watermark,
+            attack_preset=args.attack_preset,
+            proposal_options=proposal_options,
+            dpi=int(args.size_sweep_dpi),
+        )
+        return
+
+    if args.phase in {"proposal-hparam-sweep", "proposal_hparam_sweep", "hparam-sweep"}:
+        run_proposal_hparam_sweep_phase(
+            host_dir=args.host_dir,
+            watermark_path=args.watermark,
+            output_dir=args.output,
+            q4_tau_values=_parse_csv_values(args.hparam_sweep_q4_tau, float),
+            q4_margin_values=_parse_csv_values(args.hparam_sweep_q4_margin, float),
+            h01_q_values=_parse_csv_values(args.hparam_sweep_h01_q, float),
+            h01_margin_values=_parse_csv_values(args.hparam_sweep_h01_margin, float),
+            max_images=args.max_images,
+            save_outputs=not args.no_save_images,
+            invert_watermark=args.invert_watermark,
+            attack_preset=args.attack_preset,
+            repeat=repeat_value,
+            max_combinations=args.hparam_sweep_max_combinations,
+        )
+        return
+
+    if args.phase in {"proposal-plot", "proposal_plot", "plot-proposal"}:
+        proposal_plot_watermarks = _resolve_proposal_plot_watermarks(args.watermark, args.plot_watermarks)
+        proposal_plot_hosts = [s.strip() for s in str(args.proposal_plot_hosts).split(",") if s.strip()]
+        run_proposal_plot_phase(
+            host_dir=args.host_dir,
+            watermark_path=args.watermark,
+            output_dir=args.output,
+            invert_watermark=args.invert_watermark,
+            host_names=proposal_plot_hosts,
+            watermark_paths=proposal_plot_watermarks,
+            proposal_options=proposal_options,
+            y_min=float(args.proposal_plot_ymin),
+            y_max=float(args.proposal_plot_ymax),
+            dpi=int(args.proposal_plot_dpi),
+            jpeg_values=_parse_csv_values(args.proposal_plot_jpeg_values, int),
+            salt_pepper_values=_parse_csv_values(args.proposal_plot_salt_pepper_values, float),
+            median_sizes=_parse_csv_values(args.proposal_plot_median_sizes, int),
+            resize_values=_parse_csv_values(args.proposal_plot_resize_values, float),
+            jpeg2000_values=_parse_csv_values(args.proposal_plot_jpeg2000_values, float),
+            rotate_values=_parse_csv_values(args.proposal_plot_rotate_values, float),
+            plot_layout=str(args.proposal_plot_layout),
+        )
+        return
 
     result = run_benchmark(
         host_dir=args.host_dir,
@@ -789,6 +2615,8 @@ def main():
         proposal_options=proposal_options,
         baseline_modes=baseline_modes,
         guo_options=guo_options,
+        gaata_options=gaata_options,
+        resume_attacks=args.resume_attack_journal,
     )
     if not result["results"].empty:
         print(f"Saved per-image results to: {Path(args.output) / 'per_image_attack_results.csv'}")

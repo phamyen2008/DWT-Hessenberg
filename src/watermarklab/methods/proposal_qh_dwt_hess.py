@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 import hashlib
 import math
 import random
+import os
+import warnings
 from typing import Any
 
 import cv2
@@ -50,6 +52,12 @@ HPOS_CANDIDATES: tuple[tuple[str, tuple[int, int]], ...] = (
     ("h22", (1, 1)),
 )
 
+# All new 4x4/8x8/16x16 keys encode absolute H positions in hpos_list.
+# Values 0 and 1 remain reserved for decoding older fixed-position keys.
+# New keys use values >= 2, even if their selected position is h21 or h22.
+H_ENERGY_POSITION_OFFSET = 2
+H_ENERGY_POSITION_STRIDE = 16  # maximal supported block dimension
+
 EPS_CONF = 1e-12
 
 MIN_SURVIVAL_RATE = 0.75
@@ -65,7 +73,9 @@ Q4_GIVENS_FINE_STEPS = 0
 Q4_GIVENS_PASSES = 1
 Q4_GIVENS_MSE_WEIGHT = 0.10
 Q4_GIVENS_EXTRA_MARGIN_WEIGHT = 0.04
-Q4_GIVENS_PAIRS = ((0, 2), (1, 3), (0, 1), (1, 2))
+# (1,2) is intentionally excluded: rotating those two rows preserves
+# q[1,1]**2 + q[2,1]**2 and cannot change the Q-branch decision statistic.
+Q4_GIVENS_PAIRS = ((0, 2), (1, 3), (0, 1))
 
 FAST_CANDIDATE_SCORING = True
 USE_STRUCTURED_REPETITION = True
@@ -125,11 +135,29 @@ class ProposalParams:
     q4_givens_pairs: tuple[tuple[int, int], ...] = Q4_GIVENS_PAIRS
     fast_candidate_scoring: bool = FAST_CANDIDATE_SCORING
 
+    # Optional experimental mode: do not treat a pre-existing decoded bit as
+    # evidence of embedding. This trades capacity for contrast against originals.
+    # Legacy mode remains default for honest reproduction of manuscript tables.
+    require_contrastive_embedding: bool = False
     watermark_dwt_enabled: bool = True
     watermark_payload_band: str = "LL"
     host_embed_color_space: str = HOST_EMBED_COLOR_SPACE
     host_channels: tuple[int, ...] = HOST_CHANNELS
     structured_repetition_enabled: bool = USE_STRUCTURED_REPETITION
+
+    # Ablation-only switches. Defaults keep the full proposal unchanged.
+    # q4/hpos_enabled isolate the two Hessenberg embedding branches.
+    # arnold_enabled tests the contribution of spatial scrambling.
+    # candidate_selection_mode tests how BSS/MSE candidate selection affects results.
+    ablation_name: str = "full"
+    q4_enabled: bool = True
+    hpos_enabled: bool = True
+    arnold_enabled: bool = True
+    candidate_selection_mode: str = "bss_mse"
+    # Manuscript: choose the lowest-distortion eligible H coefficient first,
+    # then compare that single H candidate against Q. "independent" preserves
+    # the previous three-way Q/H-diagonal/H-subdiagonal experiment.
+    h_selection_policy: str = "manuscript"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ProposalParams":
@@ -174,6 +202,8 @@ class ProposalParams:
 
         # Keep H-domain margin inside the same safe interval used by the source script.
         params.h01_margin = min(float(params.h01_margin), 0.49 * float(params.h01_q))
+        if params.h_selection_policy not in {"manuscript", "independent"}:
+            raise ValueError("h_selection_policy must be manuscript or independent")
         return params
 
     def to_dict(self) -> dict[str, Any]:
@@ -194,6 +224,9 @@ class ProposalKey:
     usable_blocks: int
     total_blocks: int
     support_counts: list[int] = field(default_factory=list)
+    embedding_errors: list[str] = field(default_factory=list)
+    selected_bss: list[float] = field(default_factory=list)
+    selected_mse: list[float] = field(default_factory=list)
     # Kept for compatibility/debugging.  Extraction regenerates the schedule
     # from the key and image, matching the standalone script behavior.
     schedule: list[tuple[int, int, str, int, int]] = field(default_factory=list)
@@ -202,6 +235,28 @@ class ProposalKey:
     def wm_shape(self) -> tuple[int, int]:
         return tuple(int(x) for x in self.payload_meta.get("wm_shape", (WM_SIZE, WM_SIZE)))
 
+
+@dataclass
+class PayloadDecodeResult:
+    bits: np.ndarray
+    valid_mask: np.ndarray
+    vote_counts: np.ndarray
+    confidence: np.ndarray
+    tie_mask: np.ndarray
+    errors: list[str] = field(default_factory=list)
+    metadata_model: str = "unspecified"
+
+    @property
+    def coverage(self) -> float:
+        return float(np.mean(self.valid_mask)) if self.valid_mask.size else 0.0
+
+    @property
+    def erasures(self) -> int:
+        return int(np.count_nonzero(self.vote_counts == 0))
+
+    @property
+    def ties(self) -> int:
+        return int(np.count_nonzero(self.tie_mask))
 
 # =========================================================
 # JSON / numeric helpers
@@ -276,14 +331,22 @@ def _source_bgr_to_rgb(img_bgr: np.ndarray) -> np.ndarray:
     return _ensure_uint8_rgb_basic(img_bgr)[:, :, ::-1].copy()
 
 
-def _host_bgr_to_embed_space(img_bgr: np.ndarray) -> np.ndarray:
-    img_bgr = _ensure_uint8_rgb_basic(img_bgr)  # shape/type guard only
-    return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb).astype(np.uint8)
+def _host_bgr_to_embed_space(img_bgr: np.ndarray, color_space: str = "YCrCb") -> np.ndarray:
+    img_bgr = _ensure_uint8_rgb_basic(img_bgr)
+    if color_space.upper() == "RGB":
+        return img_bgr[:, :, ::-1].copy()
+    if color_space.upper() == "YCRCB":
+        return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb).astype(np.uint8)
+    raise ValueError(f"Unsupported host embedding color space {color_space}")
 
 
-def _embed_space_to_host_bgr(img_embed: np.ndarray) -> np.ndarray:
+def _embed_space_to_host_bgr(img_embed: np.ndarray, color_space: str = "YCrCb") -> np.ndarray:
     img_embed = _ensure_uint8_rgb_basic(img_embed)
-    return cv2.cvtColor(img_embed, cv2.COLOR_YCrCb2BGR).astype(np.uint8)
+    if color_space.upper() == "RGB":
+        return img_embed[:, :, ::-1].copy()
+    if color_space.upper() == "YCRCB":
+        return cv2.cvtColor(img_embed, cv2.COLOR_YCrCb2BGR).astype(np.uint8)
+    raise ValueError(f"Unsupported host embedding color space {color_space}")
 
 
 # =========================================================
@@ -314,8 +377,9 @@ def _dwt_split_4bands(channel_f64: np.ndarray, params: ProposalParams):
         if pywt is not None:
             LL, (LH, HL, HH) = pywt.dwt2(np.asarray(channel_f64, dtype=np.float64), DWT_WAVELET)
             return {"LL": LL.copy(), "LH": LH.copy(), "HL": HL.copy(), "HH": HH.copy()}
-        # Fallback for environments that have not installed PyWavelets yet.
-        # requirements.txt/pyproject.toml include PyWavelets, so normal runs use pywt.
+        if os.environ.get("WATERMARKLAB_STRICT_PYWT") == "1":
+            raise ImportError("PyWavelets is required for reproducibility mode; install requirements.txt")
+        warnings.warn("PyWavelets unavailable: explicit orthonormal Haar fallback in use; set WATERMARKLAB_STRICT_PYWT=1 for strict runs", RuntimeWarning, stacklevel=2)
         return split_4bands(channel_f64, mode="orthonormal")
     return split_4bands(channel_f64, mode=params.dwt_mode)
 
@@ -324,6 +388,9 @@ def _dwt_merge_4bands(bands: dict[str, np.ndarray], params: ProposalParams):
     if str(params.dwt_mode).lower() in {"pywt", "pywt_haar", "script", "source"}:
         if pywt is not None:
             return pywt.idwt2((bands["LL"], (bands["LH"], bands["HL"], bands["HH"])), DWT_WAVELET)
+        if os.environ.get("WATERMARKLAB_STRICT_PYWT") == "1":
+            raise ImportError("PyWavelets is required for reproducibility mode; install requirements.txt")
+        warnings.warn("PyWavelets unavailable: explicit orthonormal Haar fallback in use; set WATERMARKLAB_STRICT_PYWT=1 for strict runs", RuntimeWarning, stacklevel=2)
         return merge_4bands(bands, mode="orthonormal")
     return merge_4bands(bands, mode=params.dwt_mode)
 
@@ -331,14 +398,23 @@ def _dwt_merge_4bands(bands: dict[str, np.ndarray], params: ProposalParams):
 # =========================================================
 # Watermark payload: source-script faithful LL-only watermark DWT
 # =========================================================
-def _force_binary_watermark_exact(img_u8: np.ndarray, size: int = WM_SIZE, thresh: int = WM_BIN_THRESH) -> np.ndarray:
+def _force_binary_watermark_exact(img_u8: np.ndarray, size: int | None = WM_SIZE, thresh: int = WM_BIN_THRESH) -> np.ndarray:
     if img_u8 is None:
         raise ValueError("Watermark image is None.")
     out = np.asarray(img_u8, dtype=np.uint8)
     if out.ndim == 3:
         out = np.mean(out[:, :, :3], axis=2).astype(np.uint8)
-    if out.shape != (size, size):
-        raise ValueError(f"Binary watermark must be exactly {size}x{size}. Got {out.shape}.")
+    if out.ndim != 2:
+        raise ValueError(f"Binary watermark must be a 2-D image. Got {out.shape}.")
+    if size is not None:
+        size = int(size)
+        if out.shape != (size, size):
+            raise ValueError(f"Binary watermark must be exactly {size}x{size}. Got {out.shape}.")
+    else:
+        if out.shape[0] != out.shape[1]:
+            raise ValueError(f"Binary watermark must be square for Arnold scrambling and DWT payload extraction. Got {out.shape}.")
+        if out.shape[0] < 2:
+            raise ValueError(f"Binary watermark is too small. Got {out.shape}.")
     return np.where(out >= int(thresh), 255, 0).astype(np.uint8)
 
 
@@ -346,48 +422,83 @@ def prepare_binary_watermark_payload_from_array(
     watermark_binary: np.ndarray,
     params: ProposalParams,
 ):
-    wm_binary = _force_binary_watermark_exact(watermark_binary, WM_SIZE, WM_BIN_THRESH)
+    # The original script used 64x64 watermarks.  The size-sweep command keeps
+    # the same algorithm but permits any square, even-sized binary watermark
+    # supplied by the in-memory resizing adapter.
+    wm_binary = _force_binary_watermark_exact(watermark_binary, None, WM_BIN_THRESH)
+    wm_size = int(wm_binary.shape[0])
+    if bool(params.watermark_dwt_enabled) and wm_size % 2 != 0:
+        raise ValueError(f"Watermark size must be even when watermark DWT payload is enabled. Got {wm_size}x{wm_size}.")
     wm_bits_2d = (wm_binary >= WM_BIN_THRESH).astype(np.float64)
 
-    # Same as pywt.dwt2(wm_bits_2d, 'haar') -> LL, (LH, HL, HH)
-    bands = _dwt_split_4bands(wm_bits_2d, params)
-    LL, LH, HL, HH = bands["LL"], bands["LH"], bands["HL"], bands["HH"]
+    # Full proposal: embed only the LL subband of the watermark DWT and preserve
+    # the detail subbands in the key. Ablation can disable this to embed the full
+    # binary watermark payload directly.
+    if bool(params.watermark_dwt_enabled):
+        bands = _dwt_split_4bands(wm_bits_2d, params)
+        LL, LH, HL, HH = bands["LL"], bands["LH"], bands["HL"], bands["HH"]
 
-    ll_threshold = 1.0
-    ll_bits_2d = (LL >= ll_threshold).astype(np.uint8)
+        ll_threshold = 1.0
+        ll_bits_2d = (LL >= ll_threshold).astype(np.uint8)
 
-    low_vals = LL[LL < ll_threshold]
-    high_vals = LL[LL >= ll_threshold]
-    ll_low_value = float(np.mean(low_vals)) if low_vals.size > 0 else 0.0
-    ll_high_value = float(np.mean(high_vals)) if high_vals.size > 0 else 2.0
+        low_vals = LL[LL < ll_threshold]
+        high_vals = LL[LL >= ll_threshold]
+        ll_low_value = float(np.mean(low_vals)) if low_vals.size > 0 else 0.0
+        ll_high_value = float(np.mean(high_vals)) if high_vals.size > 0 else 2.0
 
-    scrambled_bits_2d = arnold_scramble(ll_bits_2d, int(params.arnold_iterations))
-    payload_bits = scrambled_bits_2d.reshape(-1).astype(np.uint8)
+        if bool(params.arnold_enabled):
+            scrambled_bits_2d = arnold_scramble(ll_bits_2d, int(params.arnold_iterations))
+        else:
+            scrambled_bits_2d = ll_bits_2d.astype(np.uint8)
+        payload_bits = scrambled_bits_2d.reshape(-1).astype(np.uint8)
 
+        meta = {
+            "wm_shape": tuple(int(x) for x in wm_binary.shape),
+            "wm_size": int(wm_size),
+            "original_wm_bit_len": int(wm_bits_2d.size),
+            "wm_bit_len": int(ll_bits_2d.size),
+            "payload_len": int(payload_bits.size),
+            "payload_shape": tuple(int(x) for x in ll_bits_2d.shape),
+            "arnold_enabled": bool(params.arnold_enabled),
+            "arnold_iterations": int(params.arnold_iterations if params.arnold_enabled else 0),
+            "watermark_dwt_enabled": True,
+            "watermark_dwt_wavelet": DWT_WAVELET,
+            "watermark_dwt_level": 1,
+            "watermark_payload_band": "LL",
+            "watermark_ll_threshold": float(ll_threshold),
+            "watermark_ll_low_value": float(ll_low_value),
+            "watermark_ll_high_value": float(ll_high_value),
+            "watermark_detail_subbands": {
+                "LH": LH.astype(float).tolist(),
+                "HL": HL.astype(float).tolist(),
+                "HH": HH.astype(float).tolist(),
+            },
+        }
+        return wm_binary, payload_bits, meta
+
+    # Ablation path: no watermark DWT compression. Embed all 64x64 watermark bits
+    # directly. This increases payload length and reduces repetition capacity.
+    direct_bits_2d = wm_bits_2d.astype(np.uint8)
+    if bool(params.arnold_enabled):
+        payload_2d = arnold_scramble(direct_bits_2d, int(params.arnold_iterations))
+    else:
+        payload_2d = direct_bits_2d
+    payload_bits = payload_2d.reshape(-1).astype(np.uint8)
     meta = {
         "wm_shape": tuple(int(x) for x in wm_binary.shape),
-        "wm_size": int(WM_SIZE),
+        "wm_size": int(wm_size),
         "original_wm_bit_len": int(wm_bits_2d.size),
-        "wm_bit_len": int(ll_bits_2d.size),
+        "wm_bit_len": int(wm_bits_2d.size),
         "payload_len": int(payload_bits.size),
-        "payload_shape": tuple(int(x) for x in ll_bits_2d.shape),
-        "arnold_enabled": True,
-        "arnold_iterations": int(params.arnold_iterations),
-        "watermark_dwt_enabled": True,
-        "watermark_dwt_wavelet": DWT_WAVELET,
-        "watermark_dwt_level": 1,
-        "watermark_payload_band": "LL",
-        "watermark_ll_threshold": float(ll_threshold),
-        "watermark_ll_low_value": float(ll_low_value),
-        "watermark_ll_high_value": float(ll_high_value),
-        "watermark_detail_subbands": {
-            "LH": LH.astype(float).tolist(),
-            "HL": HL.astype(float).tolist(),
-            "HH": HH.astype(float).tolist(),
-        },
+        "payload_shape": tuple(int(x) for x in wm_bits_2d.shape),
+        "arnold_enabled": bool(params.arnold_enabled),
+        "arnold_iterations": int(params.arnold_iterations if params.arnold_enabled else 0),
+        "watermark_dwt_enabled": False,
+        "watermark_dwt_wavelet": None,
+        "watermark_dwt_level": 0,
+        "watermark_payload_band": "direct_binary",
     }
     return wm_binary, payload_bits, meta
-
 
 def reconstruct_binary_watermark_from_payload_bits(payload_bits, meta: dict, params: ProposalParams):
     arnold_iterations = int(meta.get("arnold_iterations", params.arnold_iterations))
@@ -405,7 +516,10 @@ def reconstruct_binary_watermark_from_payload_bits(payload_bits, meta: dict, par
             bits_scrambled = bits_scrambled[:payload_len]
 
         scrambled_2d = bits_scrambled.reshape(payload_shape).astype(np.uint8)
-        recovered_ll_bits = arnold_unscramble(scrambled_2d, arnold_iterations)
+        if bool(meta.get("arnold_enabled", True)):
+            recovered_ll_bits = arnold_unscramble(scrambled_2d, arnold_iterations)
+        else:
+            recovered_ll_bits = scrambled_2d.astype(np.uint8)
 
         ll_low = float(meta.get("watermark_ll_low_value", 0.0))
         ll_high = float(meta.get("watermark_ll_high_value", 2.0))
@@ -432,8 +546,13 @@ def reconstruct_binary_watermark_from_payload_bits(payload_bits, meta: dict, par
         bits_scrambled = np.concatenate([bits_scrambled, np.zeros((wm_bit_len - bits_scrambled.size,), dtype=np.uint8)])
     elif bits_scrambled.size > wm_bit_len:
         bits_scrambled = bits_scrambled[:wm_bit_len]
-    scrambled_2d = bits_scrambled.reshape((wm_size, wm_size)).astype(np.uint8)
-    recovered_bits_2d = arnold_unscramble(scrambled_2d, arnold_iterations)
+    payload_shape = tuple(int(x) for x in meta.get("payload_shape", (wm_size, wm_size)))
+    scrambled_2d = bits_scrambled.reshape(payload_shape).astype(np.uint8)
+    if bool(meta.get("arnold_enabled", True)):
+        recovered_bits_2d = arnold_unscramble(scrambled_2d, arnold_iterations)
+    else:
+        recovered_bits_2d = scrambled_2d.astype(np.uint8)
+    recovered_bits_2d = recovered_bits_2d[:wm_size, :wm_size]
     return _force_binary_watermark_exact((recovered_bits_2d * 255).astype(np.uint8), wm_size, WM_BIN_THRESH)
 
 
@@ -460,8 +579,11 @@ def _q4_stat(Qm: np.ndarray) -> float:
     return float(Qm[1, 1] ** 2 + Qm[2, 1] ** 2)
 
 
-def _givens4(a: int, b: int, theta: float) -> np.ndarray:
-    G = np.eye(4, dtype=np.float64)
+def _givens4(a: int, b: int, theta: float, size: int = 4) -> np.ndarray:
+    """Size-generalized Givens rotation; the 4x4 branch is unchanged."""
+    if size not in (4, 8, 16):
+        raise ValueError("Only tested experimental block sizes 4, 8, 16 are supported")
+    G = np.eye(size, dtype=np.float64)
     c = math.cos(float(theta))
     s = math.sin(float(theta))
     G[a, a] = c
@@ -527,13 +649,18 @@ def _build_q4_candidate(block: np.ndarray, bit: int, params: ProposalParams) -> 
         improved = False
 
         for a, b in params.q4_givens_pairs:
+            # phi_Q is the squared norm of rows 1 and 2 (zero based).
+            # Rotations entirely within, or entirely outside, this row set
+            # cannot change phi_Q, and waste time in the angle search.
+            if (int(a) in (1, 2)) == (int(b) in (1, 2)):
+                continue
             local_best_Q = best_Q
             local_best_key = (best_loss, best_mse, -best_margin)
 
             for th in theta_grid:
                 if abs(float(th)) < 1e-15:
                     continue
-                G = _givens4(a, b, float(th))
+                G = _givens4(a, b, float(th), size=block.shape[0])
                 Qtrial = G @ best_Q
                 loss, mse, signed_margin = _q4_givens_loss(block, Hh, Qtrial, bit, params)
                 key = (loss, mse, -signed_margin)
@@ -631,8 +758,15 @@ def _candidate_attack_score(block0: np.ndarray, block_cand: np.ndarray, mode: in
             pass
 
     survival_rate = float(pass_count / max(total_count, 1))
-    ok = survival_rate >= float(params.min_survival_rate)
-    return survival_rate, mse, survival_rate, survival_rate, survival_rate, ok
+    # The no-attack candidate is a mandatory validity condition, not merely one
+    # vote in the empirical BSS score.  An invalid clean candidate must never
+    # enter the selector (including the no-strength-filter ablation).
+    try:
+        exact_valid = int(_extract_bit_from_candidate_block(base, mode, params, pos=pos)) == int(bit)
+    except (ValueError, np.linalg.LinAlgError, FloatingPointError):
+        exact_valid = False
+    ok = exact_valid and survival_rate >= float(params.min_survival_rate)
+    return survival_rate, mse, float(exact_valid), survival_rate, survival_rate, ok
 
 
 def _candidate_mse_limit(cand: dict, params: ProposalParams) -> float:
@@ -655,7 +789,7 @@ def _candidate_rank_key(cand: dict, params: ProposalParams):
 
 
 def _candidate_is_strong_enough(cand: dict, params: ProposalParams) -> bool:
-    if not bool(cand["ok"]):
+    if not bool(cand.get("raw", 0.0)) or not bool(cand["ok"]):
         return False
     if float(cand["score"]) < float(params.min_survival_rate):
         return False
@@ -666,14 +800,82 @@ def _candidate_is_strong_enough(cand: dict, params: ProposalParams) -> bool:
     return True
 
 
-def _best_hpos_candidate(block0: np.ndarray, bit: int, params: ProposalParams) -> dict:
-    all_h: list[dict] = []
-    valid_h: list[dict] = []
+def _rank_hpos_by_energy(block0: np.ndarray) -> tuple[tuple[str, tuple[int, int]], ...]:
+    """Return two *group-wise* Hessenberg energy maxima, not global Top-2.
 
-    for hpos_idx, (hname, pos) in enumerate(HPOS_CANDIDATES):
+    One candidate comes from the main diagonal H[i,i]; the other comes from
+    the legal lower half of an upper-Hessenberg matrix, its first subdiagonal
+    H[i,i-1]. This corresponds to the manuscript's h22-versus-h21 distinction.
+    The two positions are selected before seeing the watermark bit, using
+    the *original* block.  Each group's ties break toward the smallest row.
+    Each group maximum is independently embedded and scored; the final
+    selector can compare both H candidates directly against the Q candidate.
+    Works at block sizes 4, 8, and 16.
+    """
+    block = np.asarray(block0, dtype=np.float64)
+    n = int(block.shape[0])
+    if block.shape != (n, n) or n not in (4, 8, 16):
+        raise ValueError("H energy ranking requires a square 4, 8 or 16 block")
+    H = hessenberg(block, calc_q=False)
+
+    def strongest(group: list[tuple[int, int]]) -> tuple[str, tuple[int, int]]:
+        ranking = []
+        for rr, cc in group:
+            energy = float(H[rr, cc]) ** 2
+            if not math.isfinite(energy):
+                raise ValueError("nonfinite Hessenberg coefficient energy")
+            ranking.append((-energy, rr, cc))
+        _, rr, cc = min(ranking)  # deterministic tie-breaking
+        return f"h{rr + 1},{cc + 1}", (rr, cc)
+
+    diagonal = [(i, i) for i in range(n)]
+    subdiagonal = [(i, i - 1) for i in range(1, n)]
+    return strongest(diagonal), strongest(subdiagonal)
+
+
+def _encode_hpos(pos: tuple[int, int], block_size: int) -> int:
+    """Encode the absolute H position for every supported block size.
+
+    Codes 0 and 1 are deliberately never emitted; decoding them remains
+    supported for pre-update key compatibility (legacy h21/h22).
+    """
+    rr, cc = (int(pos[0]), int(pos[1]))
+    n = int(block_size)
+    if n not in (4, 8, 16) or not (0 <= rr < n and 0 <= cc < n and rr <= cc + 1):
+        raise ValueError("invalid H energy position")
+    return H_ENERGY_POSITION_OFFSET + H_ENERGY_POSITION_STRIDE * rr + cc
+
+
+def _decode_hpos(index: int, block_size: int) -> tuple[int, int]:
+    """Decode new position values and earlier 0/1-indexed side information."""
+    i, n = int(index), int(block_size)
+    if i in (0, 1):
+        return HPOS_CANDIDATES[i][1]
+    if n not in (4, 8, 16) or i < H_ENERGY_POSITION_OFFSET:
+        raise ValueError("invalid H coefficient index")
+    k = i - H_ENERGY_POSITION_OFFSET
+    rr, cc = divmod(k, H_ENERGY_POSITION_STRIDE)
+    if not (0 <= rr < n and 0 <= cc < n and rr <= cc + 1):
+        raise ValueError("invalid encoded H position for this block size")
+    return rr, cc
+
+
+def _hpos_group_candidates(block0: np.ndarray, bit: int, params: ProposalParams) -> list[dict]:
+    """Produce TWO independent H embedding candidates: one per energy group.
+
+    Do not pick a representative H candidate here. Each candidate is embedded,
+    scored and filtered separately and then competes directly with the Q-domain
+    candidate in ``_select_candidate_for_ablation``.
+    """
+    candidates: list[dict] = []
+    for group, (hname, pos) in zip(("main_diagonal", "first_subdiagonal"),
+                                   _rank_hpos_by_energy(block0)):
+        hpos_idx = _encode_hpos(pos, block0.shape[0])
         block_h = _build_hpos_candidate(block0, bit, params, pos)
-        score_h, mse_h, raw_h, avg_h, worst_h, ok_h = _candidate_attack_score(block0, block_h, FLAG_HPOS, bit, params, pos=pos)
-        cand = {
+        score_h, mse_h, raw_h, avg_h, worst_h, ok_h = _candidate_attack_score(
+            block0, block_h, FLAG_HPOS, bit, params, pos=pos
+        )
+        candidates.append({
             "flag": FLAG_HPOS,
             "block": block_h,
             "score": score_h,
@@ -684,15 +886,43 @@ def _best_hpos_candidate(block0: np.ndarray, bit: int, params: ProposalParams) -
             "ok": ok_h,
             "hpos_idx": hpos_idx,
             "hpos_name": hname,
+            "h_group": group,
             "pos": pos,
-        }
-        all_h.append(cand)
-        if _candidate_is_strong_enough(cand, params):
-            valid_h.append(cand)
+        })
+    return candidates
 
-    if valid_h:
-        return min(valid_h, key=lambda c: float(c["mse"]))
-    return min(all_h, key=lambda c: float(c["mse"]))
+
+
+def _select_candidate_for_ablation(cands: list[dict], params: ProposalParams) -> dict | None:
+    """Select the candidate block according to the active proposal/ablation rule."""
+    if not cands:
+        return None
+
+    mode = str(getattr(params, "candidate_selection_mode", "bss_mse")).lower().strip()
+    if mode in {"no_strength_filter", "unfiltered", "raw"}:
+        # Removing the strength filter must not remove fundamental decodability.
+        pool = [c for c in cands if bool(c.get("raw", 0.0))]
+    else:
+        pool = [c for c in cands if _candidate_is_strong_enough(c, params)]
+
+    if not pool:
+        return None
+
+    if params.h_selection_policy == "manuscript":
+        # The manuscript first picks the smallest-MSE *eligible* H position,
+        # then compares it with Q using the active BSS/MSE (or ablation) rule.
+        # Do not accidentally choose an invalid H candidate to represent H.
+        h_pool = [c for c in pool if int(c["flag"]) == FLAG_HPOS]
+        if len(h_pool) > 1:
+            h_winner = min(h_pool, key=lambda c: (float(c["mse"]), -float(c["score"])))
+            pool = [c for c in pool if int(c["flag"]) != FLAG_HPOS] + [h_winner]
+    if mode in {"mse", "mse_only", "min_mse"}:
+        return min(pool, key=lambda c: float(c["mse"]))
+    if mode in {"bss", "bss_only", "survival_only"}:
+        return sorted(pool, key=lambda c: (float(c["score"]), -float(c["mse"])), reverse=True)[0]
+
+    # Default full proposal: BSS/MSE weighted rank, matching the existing method.
+    return sorted(pool, key=lambda c: _candidate_rank_key(c, params), reverse=True)[0]
 
 
 # =========================================================
@@ -773,13 +1003,17 @@ class ProposalQHDWTHess:
         optimizer_seed: int = 123,
     ):
         self.params = params if isinstance(params, ProposalParams) else ProposalParams.from_dict(params)
+        if int(self.params.block_size) not in (4, 8, 16):
+            raise ValueError("The experimental Q/H block-size extension supports only 4, 8 or 16")
+        # All sizes use one diagonal and one first-subdiagonal energy maximum.
+        # Q statistics and the existing score/rotation logic remain unchanged.
         self.use_optimizer = bool(use_optimizer)
         self.optimizer_trials = int(optimizer_trials)
         self.optimizer_seed = int(optimizer_seed)
 
     def _prepare_embed_space_from_rgb(self, host_rgb: np.ndarray):
         host_bgr = _rgb_to_source_bgr(host_rgb)
-        host_embed_orig = _host_bgr_to_embed_space(host_bgr)
+        host_embed_orig = _host_bgr_to_embed_space(host_bgr, self.params.host_embed_color_space)
         bands_by_ch: dict[int, dict[str, np.ndarray]] = {}
         H0 = W0 = None
         for ch in self.params.host_channels:
@@ -792,8 +1026,11 @@ class ProposalQHDWTHess:
     def _embed_with_params(self, host_rgb: np.ndarray, watermark_binary: np.ndarray, params: ProposalParams):
         self.params = params
         host_rgb = _ensure_uint8_rgb_basic(host_rgb)
-        if host_rgb.shape[0] != HOST_SIZE or host_rgb.shape[1] != HOST_SIZE:
-            raise ValueError(f"Host image must be exactly {HOST_SIZE}x{HOST_SIZE}. Got {host_rgb.shape[1]}x{host_rgb.shape[0]}.")
+        if host_rgb.shape[0] < _required_multiple_for_dwt(DWT_LEVEL, params.block_size) or host_rgb.shape[1] < _required_multiple_for_dwt(DWT_LEVEL, params.block_size):
+            raise ValueError(
+                f"Host image is too small for DWT + {params.block_size}x{params.block_size} blocks. "
+                f"Got {host_rgb.shape[1]}x{host_rgb.shape[0]}."
+            )
 
         host_bgr, host_embed_orig, bands_by_ch, H0, W0 = self._prepare_embed_space_from_rgb(host_rgb)
         wm_binary, payload_bits, wm_meta = prepare_binary_watermark_payload_from_array(watermark_binary, params)
@@ -809,6 +1046,10 @@ class ProposalQHDWTHess:
             repeat_arg = params.repeat
         schedule, repeat_factor, usable_blocks = _make_structured_schedule(positions, L, repeat_arg)
 
+        embedding_errors: list[str] = []
+        selected_bss: list[float] = []
+        selected_mse: list[float] = []
+        h_group_selected = {"main_diagonal": 0, "first_subdiagonal": 0}
         flags: list[int] = []
         hpos_list: list[int] = []
         support_counts = np.zeros(L, dtype=np.int32)
@@ -821,38 +1062,67 @@ class ProposalQHDWTHess:
             block0 = band[i : i + bs, j : j + bs].copy()
 
             try:
-                block_q4 = _build_q4_candidate(block0, bit, params)
-                score_q4, mse_q4, raw_q4, avg_q4, worst_q4, ok_q4 = _candidate_attack_score(block0, block_q4, FLAG_Q4, bit, params)
-                q_cand = {
-                    "flag": FLAG_Q4,
-                    "block": block_q4,
-                    "score": score_q4,
-                    "mse": mse_q4,
-                    "raw": raw_q4,
-                    "avg": avg_q4,
-                    "worst": worst_q4,
-                    "ok": ok_q4,
-                    "hpos_idx": HPOS_NONE,
-                    "hpos_name": "none",
-                }
+                cands: list[dict] = []
 
-                best_h = _best_hpos_candidate(block0, bit, params)
-                cands = [q_cand, best_h]
-                strong_cands = [c for c in cands if _candidate_is_strong_enough(c, params)]
+                if bool(params.q4_enabled):
+                    block_q4 = _build_q4_candidate(block0, bit, params)
+                    score_q4, mse_q4, raw_q4, avg_q4, worst_q4, ok_q4 = _candidate_attack_score(block0, block_q4, FLAG_Q4, bit, params)
+                    cands.append({
+                        "flag": FLAG_Q4,
+                        "block": block_q4,
+                        "score": score_q4,
+                        "mse": mse_q4,
+                        "raw": raw_q4,
+                        "avg": avg_q4,
+                        "worst": worst_q4,
+                        "ok": ok_q4,
+                        "hpos_idx": HPOS_NONE,
+                        "hpos_name": "none",
+                    })
 
-                if strong_cands:
-                    best = sorted(strong_cands, key=lambda c: _candidate_rank_key(c, params), reverse=True)[0]
+                if bool(params.hpos_enabled):
+                    # Each group maximum is a distinct candidate in the final
+                    # Q vs H-diagonal vs H-subdiagonal competition.
+                    cands.extend(_hpos_group_candidates(block0, bit, params))
+
+                if params.require_contrastive_embedding:
+                    # Reject configurations that already decode as the target
+                    # in the unmodified host block. Otherwise a key derived
+                    # during embedding can 'recognize' an unmarked original.
+                    contrastive = []
+                    for cand in cands:
+                        p0 = (cand["pos"] if cand["flag"] == FLAG_HPOS else None)
+                        try:
+                            old_bit = _extract_bit_from_candidate_block(block0, cand["flag"], params, pos=p0)
+                            if old_bit != bit and cand["mse"] > 1e-12:
+                                contrastive.append(cand)
+                        except (ValueError, ArithmeticError, np.linalg.LinAlgError):
+                            pass
+                    cands = contrastive
+                best = _select_candidate_for_ablation(cands, params)
+                if best is not None:
                     band[i : i + bs, j : j + bs] = best["block"]
                     flags.append(int(best["flag"]))
                     hpos_list.append(int(best.get("hpos_idx", HPOS_NONE)))
+                    if int(best["flag"]) == FLAG_HPOS:
+                        h_group_selected[best["h_group"]] += 1
+                    selected_bss.append(float(best["score"]))
+                    selected_mse.append(float(best["mse"]))
                     support_counts[kpos] += 1
                     support_sel_sum[kpos] += float(_combined_selection_score(best, params))
                 else:
                     flags.append(FLAG_SKIP)
                     hpos_list.append(HPOS_NONE)
-            except Exception:
+                    selected_bss.append(float("nan"))
+                    selected_mse.append(float("nan"))
+            except (ValueError, ArithmeticError, np.linalg.LinAlgError) as exc:
+                # Keep the experiment running but disclose recoverable numerical failures.
+                if len(embedding_errors) < 50:
+                    embedding_errors.append(f"block {len(flags)}: {type(exc).__name__}: {exc}")
                 flags.append(FLAG_SKIP)
                 hpos_list.append(HPOS_NONE)
+                selected_bss.append(float("nan"))
+                selected_mse.append(float("nan"))
 
         watermarked_embed = host_embed_orig.copy()
         for ch in params.host_channels:
@@ -862,13 +1132,20 @@ class ProposalQHDWTHess:
             out_channel[:H0, :W0] = np.clip(np.rint(rec_channel), 0, 255)
             watermarked_embed[:, :, int(ch)] = out_channel.astype(np.uint8)
 
-        watermarked_bgr = _embed_space_to_host_bgr(watermarked_embed)
+        watermarked_bgr = _embed_space_to_host_bgr(watermarked_embed, params.host_embed_color_space)
         watermarked_rgb = _source_bgr_to_rgb(watermarked_bgr)
 
         q4_used, hpos_used, skip_used = _flag_stats(flags)
         wm_meta.update(
             {
                 "structured_repetition_enabled": bool(params.structured_repetition_enabled),
+                "proposal_ablation": str(params.ablation_name),
+                "q4_enabled": bool(params.q4_enabled),
+                "hpos_enabled": bool(params.hpos_enabled),
+                "arnold_enabled": bool(params.arnold_enabled),
+                "candidate_selection_mode": str(params.candidate_selection_mode),
+                "contrastive_mode": bool(params.require_contrastive_embedding),
+                "watermark_dwt_enabled_param": bool(params.watermark_dwt_enabled),
                 "structured_repeat_factor": int(repeat_factor),
                 "structured_usable_blocks": int(usable_blocks),
                 "dwt_bands": list(params.dwt_bands),
@@ -881,7 +1158,12 @@ class ProposalQHDWTHess:
                 "total_flags": int(len(flags)),
                 "parameter_snapshot": _to_json_safe(params.to_dict()),
                 "block_hash": "SHA-256",
-                "h_candidates": [name for name, _ in HPOS_CANDIDATES],
+                "h_candidates": ["best_main_diagonal_energy", "best_first_subdiagonal_energy"],
+                "candidate_competition": ("H_min_MSE_then_Q_vs_H" if params.h_selection_policy == "manuscript"
+                                          else "Q_vs_independent_H_main_diagonal_vs_independent_H_first_subdiagonal"),
+                "h_selection_policy": str(params.h_selection_policy),
+                "h_group_selected": dict(h_group_selected),
+                "embedding_error_count_sampled": int(len(embedding_errors)),
                 "weighted_voting_removed": True,
                 "confidence_scoring_removed": True,
                 "bit_survival_score": "BSS = passed_stress_tests / total_stress_tests",
@@ -889,6 +1171,14 @@ class ProposalQHDWTHess:
                 "rsa_removed": True,
             }
         )
+
+        wm_meta["h_candidate_policy"] = ("manuscript_lowest_MSE_eligible_H_then_Q_competition"
+                                          if params.h_selection_policy == "manuscript"
+                                          else "per_block_best_diagonal_and_subdiagonal_H_energy")
+        wm_meta["h_energy_definition"] = "squared_H_coefficient_magnitude"
+        wm_meta["h_position_encoding"] = "2 + 16 * row + column (zero based)"
+        wm_meta["h_grouped_candidate_count"] = 2
+        wm_meta["h_candidate_groups"] = ["main_diagonal", "first_subdiagonal"]
 
         key = ProposalKey(
             flags=[int(x) for x in flags],
@@ -899,6 +1189,9 @@ class ProposalQHDWTHess:
             usable_blocks=int(usable_blocks),
             total_blocks=int(len(positions)),
             support_counts=support_counts.astype(int).tolist(),
+            embedding_errors=embedding_errors,
+            selected_bss=selected_bss,
+            selected_mse=selected_mse,
             schedule=schedule,
         )
         return watermarked_rgb, key
@@ -1099,71 +1392,79 @@ class ProposalQHDWTHess:
         params = self._quick_optimize_params(host_rgb, watermark_binary) if self.use_optimizer else self.params
         return self._embed_with_params(host_rgb, watermark_binary, params)
 
-    def _extract_payload_bits_from_rgb(self, possibly_attacked_rgb: np.ndarray, key: ProposalKey):
+    def extract_payload_diagnostics(self, possibly_attacked_rgb: np.ndarray, key: ProposalKey) -> "PayloadDecodeResult":
+        """Recover the *embedded payload* and expose erasures, ties and vote counts.
+
+        Note that coverage/majority agreement is NOT a calibrated watermark-
+        presence decision. Metadata can be host-dependent and must be analyzed
+        using original-host and unrelated-host negative controls.
+        """
         params = key.params
         payload_meta = key.payload_meta
         payload_len = int(payload_meta["payload_len"])
-        dwt_bands_for_meta = tuple(payload_meta.get("dwt_bands", params.dwt_bands))
-
+        if payload_len <= 0:
+            raise ValueError("Invalid payload length in key")
         img_bgr = _rgb_to_source_bgr(possibly_attacked_rgb)
-        embed_img = _host_bgr_to_embed_space(img_bgr)
+        embed_img = _host_bgr_to_embed_space(img_bgr, params.host_embed_color_space)
         _, H0, W0 = _crop_for_dwt(embed_img[:, :, int(params.host_channels[0])], DWT_LEVEL, params.block_size)
-        work_raw_u8 = embed_img[:H0, :W0, :].copy()
-
         local_params = ProposalParams.from_dict(params.to_dict())
-        local_params.dwt_bands = tuple(dwt_bands_for_meta)
-        bands_by_ch: dict[int, dict[str, np.ndarray]] = {}
-        for ch in local_params.host_channels:
-            bands_by_ch[int(ch)] = _dwt_split_4bands(work_raw_u8[:, :, int(ch)].astype(np.float64), local_params)
-
+        local_params.dwt_bands = tuple(payload_meta.get("dwt_bands", params.dwt_bands))
+        bands_by_ch = {int(ch): _dwt_split_4bands(embed_img[:H0, :W0, int(ch)].astype(np.float64), local_params)
+                       for ch in local_params.host_channels}
         positions = _shuffle_positions(_all_block_positions(bands_by_ch, local_params), local_params.private_key)
-        if payload_meta.get("structured_repetition_enabled", True):
-            schedule, repeat_factor, usable_blocks = _make_structured_schedule(positions, payload_len, None)
-        else:
-            schedule, repeat_factor, usable_blocks = _make_structured_schedule(positions, payload_len, 1)
+        requested_repeat = payload_meta.get("structured_repeat_factor", key.repeat_factor)
+        schedule, actual_repeat, _ = _make_structured_schedule(positions, payload_len, int(requested_repeat))
+        if actual_repeat != int(requested_repeat):
+            raise ValueError("Incompatible image dimensions or repetition schedule")
+        if len(key.flags) != len(schedule) or len(key.hpos_list) != len(schedule):
+            raise ValueError("Corrupted side information: flag/schedule length mismatch")
+        # Preserve the metadata dimensions and refuse an attack that changes
+        # the image's block geometry rather than silently shifting schedules.
+        if int(key.total_blocks) != len(positions):
+            raise ValueError("Incompatible embedding block geometry")
 
-        n = min(len(schedule), len(key.flags), len(key.hpos_list))
-        votes = [[] for _ in range(payload_len)]
+        counts_one = np.zeros(payload_len, dtype=np.int32)
+        counts_zero = np.zeros(payload_len, dtype=np.int32)
+        errors: list[str] = []
         bs = int(local_params.block_size)
-
-        for idx in range(n):
-            kpos, ch, band_name, i, j = schedule[idx]
+        for idx, (kpos, ch, band_name, i, j) in enumerate(schedule):
             flag = int(key.flags[idx])
             if flag == FLAG_SKIP:
                 continue
             try:
-                block = bands_by_ch[int(ch)][band_name][i : i + bs, j : j + bs]
+                block = bands_by_ch[int(ch)][band_name][i:i+bs, j:j+bs]
                 if block.shape != (bs, bs):
-                    continue
+                    raise ValueError("invalid block dimensions")
                 if flag == FLAG_Q4:
-                    extracted_bit = _extract_bit_from_candidate_block(block, FLAG_Q4, local_params)
+                    bit = _extract_bit_from_candidate_block(block, FLAG_Q4, local_params)
                 elif flag == FLAG_HPOS:
-                    hpos_idx = int(key.hpos_list[idx]) if idx < len(key.hpos_list) else HPOS_NONE
-                    if not (0 <= hpos_idx < len(HPOS_CANDIDATES)):
-                        continue
-                    _, pos = HPOS_CANDIDATES[hpos_idx]
-                    extracted_bit = _extract_bit_from_candidate_block(block, FLAG_HPOS, local_params, pos=pos)
+                    hpos_idx = int(key.hpos_list[idx])
+                    pos = _decode_hpos(hpos_idx, bs)
+                    bit = _extract_bit_from_candidate_block(block, FLAG_HPOS, local_params, pos=pos)
                 else:
-                    continue
-                votes[int(kpos)].append(int(extracted_bit))
-            except Exception:
-                continue
+                    raise ValueError("unknown mode flag")
+                if bit:
+                    counts_one[kpos] += 1
+                else:
+                    counts_zero[kpos] += 1
+            except (ValueError, ArithmeticError, np.linalg.LinAlgError) as exc:
+                if len(errors) < 50:
+                    errors.append(f"vote {idx}: {type(exc).__name__}: {exc}")
+        counts = counts_one + counts_zero
+        valid = counts > 0
+        ties = valid & (counts_one == counts_zero)
+        bits = (counts_one > counts_zero).astype(np.uint8)
+        # Missing bits/ties remain explicitly marked in ``valid_mask``.
+        # A deterministic zero is output for legacy extract() compatibility.
+        valid &= ~ties
+        confidence = np.divide(np.abs(counts_one-counts_zero), counts, out=np.zeros(payload_len, dtype=float), where=counts>0)
+        return PayloadDecodeResult(bits=bits, valid_mask=valid, vote_counts=counts,
+                                   confidence=confidence, tie_mask=ties,
+                                   errors=errors, metadata_model=str(payload_meta.get("watermark_payload_band", "unspecified")))
 
-        out_bits = np.zeros(payload_len, dtype=np.uint8)
-        valid_count = 0
-        total_votes = 0
-        for kpos, bit_votes in enumerate(votes):
-            if not bit_votes:
-                out_bits[kpos] = 0
-                continue
-            valid_count += 1
-            total_votes += len(bit_votes)
-            ones = int(np.sum(bit_votes))
-            zeros = len(bit_votes) - ones
-            out_bits[kpos] = 1 if ones >= zeros else 0
-
-        coverage = float(valid_count / payload_len) if payload_len > 0 else 0.0
-        return out_bits, coverage
+    def _extract_payload_bits_from_rgb(self, possibly_attacked_rgb: np.ndarray, key: ProposalKey):
+        result = self.extract_payload_diagnostics(possibly_attacked_rgb, key)
+        return result.bits, result.coverage
 
     def extract(self, possibly_attacked_rgb: np.ndarray, key: ProposalKey, host_rgb: np.ndarray | None = None):
         best_bits, _coverage = self._extract_payload_bits_from_rgb(possibly_attacked_rgb, key)
@@ -1175,6 +1476,7 @@ __all__ = [
     "ProposalQHDWTHess",
     "ProposalParams",
     "ProposalKey",
+    "PayloadDecodeResult",
     "FLAG_Q4",
     "FLAG_HPOS",
     "FLAG_SKIP",
@@ -1187,6 +1489,10 @@ __all__ = [
     "_q4_stat",
     "_build_q4_candidate",
     "_build_hpos_candidate",
+    "_rank_hpos_by_energy",
+    "_hpos_group_candidates",
+    "_encode_hpos",
+    "_decode_hpos",
     "_extract_bit_from_candidate_block",
     "_make_structured_schedule",
     "_shuffle_positions",
